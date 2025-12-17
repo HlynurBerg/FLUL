@@ -1,0 +1,53 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Data directories
+data/
+*.pth
+*.pt
+*.ckpt
+Banana_ripeness/
+
+# Contributions database
+contributions/
+
+# Generated files
+visualizations/
+models/pretrained/
+
+# Documentation and Information folders
+Documentation/
+Information/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
