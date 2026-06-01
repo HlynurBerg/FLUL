@@ -1,0 +1,72 @@
+{
+  "config": {
+    "seed": 42,
+    "n_trials": 1000,
+    "n_samples": 50,
+    "n_clients": 2,
+    "n_rounds": 2,
+    "weights": [
+      1.0,
+      1.0
+    ],
+    "mu_list": [
+      0.0,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ]
+  },
+  "results": [
+    {
+      "mu": 0.0,
+      "analytical_grad_residual_mean": 0.0,
+      "numerical_grad_residual_mean": 7.885532504747772e-17,
+      "optimal_linear_residual_mean": 2.406896080012211e-15,
+      "optimal_linear_a": 1.9999999999999978,
+      "optimal_linear_b": -0.9999999999999998
+    },
+    {
+      "mu": 0.001,
+      "analytical_grad_residual_mean": 0.0010876801689315401,
+      "numerical_grad_residual_mean": 0.0010876801689315432,
+      "optimal_linear_residual_mean": 0.00017238737346964922,
+      "optimal_linear_a": 2.001024720136482,
+      "optimal_linear_b": -1.0010272408725804
+    },
+    {
+      "mu": 0.01,
+      "analytical_grad_residual_mean": 0.01067107423398959,
+      "numerical_grad_residual_mean": 0.010671074233989612,
+      "optimal_linear_residual_mean": 0.0016742705291535745,
+      "optimal_linear_a": 2.0101423799426725,
+      "optimal_linear_b": -1.0101698713018923
+    },
+    {
+      "mu": 0.1,
+      "analytical_grad_residual_mean": 0.08908430883424695,
+      "numerical_grad_residual_mean": 0.08908430883424694,
+      "optimal_linear_residual_mean": 0.012834803428963856,
+      "optimal_linear_a": 2.0921425860391354,
+      "optimal_linear_b": -1.0925603721974506
+    },
+    {
+      "mu": 1.0,
+      "analytical_grad_residual_mean": 0.2637416085821162,
+      "numerical_grad_residual_mean": 0.2637416085821162,
+      "optimal_linear_residual_mean": 0.023329637393390782,
+      "optimal_linear_a": 2.4954275458474178,
+      "optimal_linear_b": -1.4984297468207581
+    },
+    {
+      "mu": 10.0,
+      "analytical_grad_residual_mean": 0.08864357183417859,
+      "numerical_grad_residual_mean": 0.08864357183417859,
+      "optimal_linear_residual_mean": 0.0016886031203470434,
+      "optimal_linear_a": 2.9066514469539424,
+      "optimal_linear_b": -1.9080618367390911
+    }
+  ],
+  "max_analytical_numerical_diff": 7.885532504747772e-17
+}

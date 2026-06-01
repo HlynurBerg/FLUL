@@ -51,3 +51,29 @@ dist/
 build/
 *.egg-info/
 
+# MIA shadow-model cache (large intermediate, regeneratable)
+mia_cache/
+
+# Claude Code runtime
+.claude/scheduled_tasks.lock
+
+# Lean build artefacts
+theory/.lake/
+
+# Generated experiment artefacts (kept locally, regeneratable by re-running the
+# orchestrators; the *_summary.json records live in summaries/). Removed from
+# tracking but left on disk.
+/mia_*.json
+/phase14_class_histograms.json
+/*.png
+
+# Local-only / draft material (kept on disk, untracked)
+/models/
+/tools/_compare_hessian.py
+/.claude/
+/.github/
+/new_report/
+/report/
+/results/
+/HANDOFF*.md
+

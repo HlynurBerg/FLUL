@@ -1,0 +1,30 @@
+{
+  "config": {
+    "seed": 42,
+    "n_trials": 500,
+    "n_features": 5,
+    "n_samples": 100,
+    "n_clients": 3,
+    "target_idx": 0
+  },
+  "gradient_subtraction_analog": {
+    "weights_a_b": [
+      1.5,
+      -0.5
+    ],
+    "residual_mean": 1.0693055292336793,
+    "residual_median": 1.0528782168471311,
+    "residual_max": 2.271618655182751,
+    "residual_min": 0.13664648794347256
+  },
+  "ols_optimal_linear": {
+    "weights_a_b": [
+      0.9966363486812033,
+      -0.3311938393264781
+    ],
+    "residual_mean": 0.8762420164063556,
+    "residual_median": 0.8491419692520101,
+    "residual_max": 1.978593633515364,
+    "residual_min": 0.2169080785940217
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "partition_mode": "dirichlet",
+  "dataset": "CIFAR10",
+  "model": "resnet18",
+  "num_clients": 4,
+  "num_rounds": 20,
+  "partition_seed": 42,
+  "target_client": 0,
+  "algorithms": [
+    "gradient",
+    "influence",
+    "class_pruning_p05_ft2"
+  ],
+  "sanity_algos": [],
+  "sanity_alpha": 1000.0,
+  "mia_attacks": [
+    "loss",
+    "modent"
+  ],
+  "points": [
+    {
+      "tag": "a1",
+      "point": 1.0,
+      "empty_clients": [],
+      "test_accuracy_original": 0.683,
+      "test_loss_original": 1.1256688902743708,
+      "test_accuracy_retrain": 0.6624,
+      "test_loss_retrain": 1.391300965707523,
+      "retrain": {
+        "loss": 0.476727,
+        "modent": 0.47701849999999996
+      },
+      "algos": {
+        "gradient": {
+          "loss": 0.64771,
+          "modent": 0.6472175,
+          "test_accuracy": 0.6872,
+          "test_loss": 1.126676901320743,
+          "gap_loss": 0.170983,
+          "gap_modent": 0.17019900000000004
+        },
+        "influence": {
+          "loss": 0.6343245,
+          "modent": 0.6339969999999999,
+          "test_accuracy": 0.691,
+          "test_loss": 1.1029137646316722,
+          "gap_loss": 0.15759749999999995,
+          "gap_modent": 0.15697849999999997
+        },
+        "class_pruning_p05_ft2": {
+          "loss": 0.589689,
+          "modent": 0.5912390000000001,
+          "test_accuracy": 0.7069,
+          "test_loss": 0.9003118060197041,
+          "gap_loss": 0.112962,
+          "gap_modent": 0.11422050000000011
+        }
+      },
+      "elapsed_seconds": 2109.7350000000006,
+      "original": {
+        "loss": 0.6888205,
+        "modent": 0.688879
+      }
+    }
+  ]
+}

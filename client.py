@@ -1,9 +1,11 @@
 """Flower client for federated learning."""
 import argparse
+import json
 
 import flwr as fl
 import torch
 
+import sample_ids
 from model import AVAILABLE_MODELS, create_model, get_parameters, set_parameters
 from utils import load_data, train_epoch, test
 
@@ -65,8 +67,48 @@ def main():
         "--partition-type",
         type=str,
         default="horizontal",
-        choices=["horizontal", "vertical", "class_vertical"],
-        help="How to partition data: horizontal (by samples), vertical (by features), or class_vertical (by class)",
+        choices=["horizontal", "vertical", "class_vertical", "dirichlet"],
+        help="How to partition data: horizontal (IID), vertical (by features), class_vertical (per-client class imbalance), or dirichlet (per-class Dirichlet(α) label skew).",
+    )
+    parser.add_argument(
+        "--partition-seed",
+        type=int,
+        default=None,
+        help=(
+            "RNG seed for horizontal random_split AND dirichlet sampling "
+            "(default: %s). Must match across runs for stable global sample ids."
+        )
+        % (sample_ids.DEFAULT_PARTITION_SEED,),
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=None,
+        help="Dirichlet concentration for partition_type=dirichlet. Smaller → more skew (e.g. 0.1 extreme non-IID, 10 mild, 1000 ≈ IID). Required for dirichlet.",
+    )
+    parser.add_argument(
+        "--primary-share",
+        type=float,
+        default=0.85,
+        help="class_vertical: per-client share of the client's primary class (default 0.85).",
+    )
+    parser.add_argument(
+        "--secondary-share",
+        type=float,
+        default=0.05,
+        help="class_vertical: per-client share of every non-primary class (default 0.05). Set 0 for pure-class clients.",
+    )
+    parser.add_argument(
+        "--training-trace",
+        type=str,
+        default="loss",
+        choices=["none", "loss", "full"],
+        help=(
+            "Training-loop instrumentation. none: fastest. "
+            "loss: batch order + per-sample loss (enables influence_replay replay; "
+            "per-sample grads computed on demand, not stored). "
+            "full: also record grad norms during live training (expensive)."
+        ),
     )
     args = parser.parse_args()
     
@@ -95,6 +137,10 @@ def main():
     batch_size = 8 if (args.img_size and args.img_size > 224) else 32
     print(f"[Client {args.client_id}] Using batch size: {batch_size} (adjusted for image size {args.img_size})")
     
+    effective_partition_seed = (
+        args.partition_seed if args.partition_seed is not None else sample_ids.DEFAULT_PARTITION_SEED
+    )
+    
     client_loaders, testloader = load_data(
         args.dataset,
         args.num_clients,
@@ -103,6 +149,10 @@ def main():
         dataset_path=args.dataset_path,
         img_size=args.img_size,
         num_channels=args.num_channels,
+        partition_seed=args.partition_seed,
+        dirichlet_alpha=args.dirichlet_alpha,
+        primary_share=args.primary_share,
+        secondary_share=args.secondary_share,
     )
     trainloader = client_loaders[args.client_id]
     
@@ -126,29 +176,48 @@ def main():
             
             # Debug: Check class distribution (only on first round and first client)
             if server_round == 0 and args.client_id == 0:
-                from debug_training import check_class_distribution
+                from Information.debug_training import check_class_distribution
                 check_class_distribution(trainloader, args.num_classes if args.num_classes else 10)
             
             # Train locally (enable debug on first round)
             # Use label smoothing for class_vertical to prevent overconfidence
             label_smoothing = 0.1 if args.partition_type == "class_vertical" else 0.0
-            train_epoch(net, trainloader, device, epochs=1, debug=(server_round == 0), label_smoothing=label_smoothing)
+            used_sample_ids = []
+            trace_mode = args.training_trace
+            training_stats = None
+            per_sample_grad_norms = False
+            if trace_mode != "none":
+                training_stats = {"batches": [], "per_sample_loss": []}
+                if trace_mode == "full":
+                    training_stats["per_sample_grad_norm"] = []
+                    per_sample_grad_norms = True
+            train_epoch(
+                net,
+                trainloader,
+                device,
+                epochs=1,
+                debug=(server_round == 0),
+                label_smoothing=label_smoothing,
+                sample_ids_accumulator=used_sample_ids,
+                training_stats=training_stats,
+                per_sample_grad_norms=per_sample_grad_norms,
+            )
             
             # Debug: Comprehensive logging (first round and every 5 rounds)
             if server_round == 0 or server_round % 5 == 0:
-                from debug_training import log_model_outputs, log_gradient_norms
-                from comprehensive_diagnostics import (
+                from Information.debug_training import log_model_outputs, log_gradient_norms
+                from Information.comprehensive_diagnostics import (
                     log_client_embeddings, log_gradient_norms_detailed,
                     check_batch_class_distribution, verify_no_activations_in_forward
                 )
-                from partial_collapse_diagnostics import (
+                from Information.partial_collapse_diagnostics import (
                     check_embedding_variance_per_class,
                     check_per_batch_class_distribution as check_batch_dist
                 )
                 
                 # Verify no softmax in forward
-                sample_images, _ = next(iter(trainloader))
-                sample_images = sample_images[:1].to(device)
+                batch = next(iter(trainloader))
+                sample_images = batch[0][:1].to(device)
                 verify_no_activations_in_forward(net, sample_images)
                 
                 # Log embeddings and logits
@@ -188,14 +257,38 @@ def main():
             loss, accuracy = test(net, testloader, device)
             print(f"[Client {args.client_id}] Round {server_round}: Training complete - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             
-            # Return updated parameters, number of training examples, and metrics
+            # Return updated parameters, number of training examples, and metrics.
+            # Flower 1.22 rejects None values in metrics, so partition-specific
+            # fields are only added when applicable.
             metrics = {
                 "client_id": args.client_id,
                 "server_round": server_round,
                 "local_loss": float(loss),
                 "local_accuracy": float(accuracy),
-                "num_training_samples": len(trainloader.dataset)
+                "num_training_samples": len(trainloader.dataset),
+                # Flower 1.22's RecordDict<->Scalar round-trip rejects list values.
+                # Send as JSON string; contributions_db._split_metrics_for_manifest
+                # parses it back to list[int] before writing the manifest.
+                "sample_ids": json.dumps(sorted(set(int(s) for s in used_sample_ids))),
+                "sample_id_scheme_version": sample_ids.SAMPLE_ID_SCHEME_VERSION,
+                "dataset": args.dataset,
+                "partition_type": args.partition_type,
+                "trainloader_shuffle": True,
+                "training_trace_mode": args.training_trace,
             }
+            if args.partition_type in ("horizontal", "dirichlet"):
+                metrics["partition_seed"] = effective_partition_seed
+            if args.partition_type == "class_vertical":
+                metrics["class_vertical_partition_seed"] = sample_ids.IMBALANCED_CLASS_PARTITION_SEED
+                metrics["primary_share"] = float(args.primary_share)
+                metrics["secondary_share"] = float(args.secondary_share)
+            if args.partition_type == "dirichlet" and args.dirichlet_alpha is not None:
+                metrics["dirichlet_alpha"] = float(args.dirichlet_alpha)
+            if training_stats is not None:
+                metrics["training_trace_version"] = sample_ids.TRAINING_TRACE_VERSION
+                # Flower 1.22 rejects nested dicts in metrics. Send as JSON string;
+                # contributions_db._split_metrics_for_manifest parses it back.
+                metrics["training_trace"] = json.dumps(training_stats)
             
             return get_parameters(net), len(trainloader.dataset), metrics
         

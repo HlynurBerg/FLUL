@@ -1,0 +1,23 @@
+{
+  "config": {
+    "seed": 42,
+    "n_rounds": 20,
+    "n_clients": 4,
+    "n_features": 10,
+    "n_samples_per_client": 200
+  },
+  "test_1_algebraic_identity": {
+    "residual": 3.248892088305996e-16,
+    "threshold": 1e-12,
+    "pass": true
+  },
+  "test_2_iterated_history_independent": {
+    "residual": 3.218601655210948e-17,
+    "threshold": 1e-10,
+    "pass": true
+  },
+  "test_3_iterated_history_dependent": {
+    "residual": 0.03546339979943903,
+    "note": "no pass/fail threshold -- expected > 0 by design"
+  }
+}

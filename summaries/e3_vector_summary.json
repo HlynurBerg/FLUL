@@ -1,0 +1,140 @@
+{
+  "config": {
+    "seed": 42,
+    "n_trials": 1000,
+    "n_samples": 200,
+    "n_clients": 2,
+    "n_rounds": 2,
+    "weights": [
+      1.0,
+      1.0
+    ],
+    "d_list": [
+      4,
+      16
+    ],
+    "mu_list": [
+      0.0,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ]
+  },
+  "results_by_dimension": {
+    "4": [
+      {
+        "mu": 0.0,
+        "analytical_residual_norm_mean": 0.0,
+        "numerical_residual_norm_mean": 2.235864492922639e-16,
+        "optimal_linear_residual_norm_mean": 7.365568021715243e-15,
+        "max_analytical_numerical_diff": 1.0235750533041806e-15,
+        "optimal_A_frobenius": 4.000000000000001,
+        "optimal_B_frobenius": 1.9999999999999996
+      },
+      {
+        "mu": 0.001,
+        "analytical_residual_norm_mean": 0.0027673481217334044,
+        "numerical_residual_norm_mean": 0.0027673481217334113,
+        "optimal_linear_residual_norm_mean": 0.00040753340161881434,
+        "max_analytical_numerical_diff": 2.3028237404228262e-15,
+        "optimal_A_frobenius": 4.002055930063664,
+        "optimal_B_frobenius": 2.0020542999438167
+      },
+      {
+        "mu": 0.01,
+        "analytical_residual_norm_mean": 0.02715377304030174,
+        "numerical_residual_norm_mean": 0.027153773040301726,
+        "optimal_linear_residual_norm_mean": 0.003961771877711643,
+        "max_analytical_numerical_diff": 3.0732526043612024e-15,
+        "optimal_A_frobenius": 4.0203570862325435,
+        "optimal_B_frobenius": 2.020345457883988
+      },
+      {
+        "mu": 0.1,
+        "analytical_residual_norm_mean": 0.2268968401296126,
+        "numerical_residual_norm_mean": 0.22689684012961261,
+        "optimal_linear_residual_norm_mean": 0.030384376261310023,
+        "max_analytical_numerical_diff": 3.12657042439896e-15,
+        "optimal_A_frobenius": 4.1854939244176,
+        "optimal_B_frobenius": 2.185697149595879
+      },
+      {
+        "mu": 1.0,
+        "analytical_residual_norm_mean": 0.6687240932893382,
+        "numerical_residual_norm_mean": 0.6687240932893382,
+        "optimal_linear_residual_norm_mean": 0.052361778207433415,
+        "max_analytical_numerical_diff": 2.501699811584268e-15,
+        "optimal_A_frobenius": 5.000093446469192,
+        "optimal_B_frobenius": 3.0035251098918483
+      },
+      {
+        "mu": 10.0,
+        "analytical_residual_norm_mean": 0.22177205111165432,
+        "numerical_residual_norm_mean": 0.22177205111165432,
+        "optimal_linear_residual_norm_mean": 0.0035716235004411606,
+        "max_analytical_numerical_diff": 4.1748851477261605e-16,
+        "optimal_A_frobenius": 5.816731840463868,
+        "optimal_B_frobenius": 3.818382084473043
+      }
+    ],
+    "16": [
+      {
+        "mu": 0.0,
+        "analytical_residual_norm_mean": 0.0,
+        "numerical_residual_norm_mean": 5.53292173961221e-16,
+        "optimal_linear_residual_norm_mean": 2.312751887720147e-14,
+        "max_analytical_numerical_diff": 1.6336343299335358e-15,
+        "optimal_A_frobenius": 8.0,
+        "optimal_B_frobenius": 3.999999999999999
+      },
+      {
+        "mu": 0.001,
+        "analytical_residual_norm_mean": 0.006276707080055933,
+        "numerical_residual_norm_mean": 0.006276707080055959,
+        "optimal_linear_residual_norm_mean": 0.0017770840276959724,
+        "max_analytical_numerical_diff": 6.860055279436081e-15,
+        "optimal_A_frobenius": 8.004356684115,
+        "optimal_B_frobenius": 4.004358971113413
+      },
+      {
+        "mu": 0.01,
+        "analytical_residual_norm_mean": 0.06139794624965266,
+        "numerical_residual_norm_mean": 0.061397946249652634,
+        "optimal_linear_residual_norm_mean": 0.01721205077875238,
+        "max_analytical_numerical_diff": 6.0452064228401495e-15,
+        "optimal_A_frobenius": 8.04303096095614,
+        "optimal_B_frobenius": 4.043090380743609
+      },
+      {
+        "mu": 0.1,
+        "analytical_residual_norm_mean": 0.5002825258417074,
+        "numerical_residual_norm_mean": 0.5002825258417073,
+        "optimal_linear_residual_norm_mean": 0.1281258660333378,
+        "max_analytical_numerical_diff": 5.676741767910891e-15,
+        "optimal_A_frobenius": 8.384477211873664,
+        "optimal_B_frobenius": 4.387414118347077
+      },
+      {
+        "mu": 1.0,
+        "analytical_residual_norm_mean": 1.3845469483008677,
+        "numerical_residual_norm_mean": 1.3845469483008674,
+        "optimal_linear_residual_norm_mean": 0.2042294939411616,
+        "max_analytical_numerical_diff": 3.732983044310684e-15,
+        "optimal_A_frobenius": 9.986475046075004,
+        "optimal_B_frobenius": 6.014995567717337
+      },
+      {
+        "mu": 10.0,
+        "analytical_residual_norm_mean": 0.46798766869207886,
+        "numerical_residual_norm_mean": 0.4679876686920788,
+        "optimal_linear_residual_norm_mean": 0.014112013018013183,
+        "max_analytical_numerical_diff": 8.870935549741215e-16,
+        "optimal_A_frobenius": 11.623139378926604,
+        "optimal_B_frobenius": 7.635899392658124
+      }
+    ]
+  },
+  "global_max_analytical_numerical_diff": 6.860055279436081e-15
+}

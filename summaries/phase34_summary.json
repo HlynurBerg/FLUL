@@ -1,0 +1,146 @@
+{
+  "dataset": "CIFAR10",
+  "model": "resnet18",
+  "target_client": 0,
+  "evaluate_clients": [
+    1,
+    2,
+    3
+  ],
+  "round": 20,
+  "attacks": [
+    "loss",
+    "modent"
+  ],
+  "algo": "class_pruning_p05_ft2",
+  "alpha_list": [
+    0.5,
+    0.1
+  ],
+  "conditions": [
+    {
+      "alpha": 0.5,
+      "tag": "0p5",
+      "type": "baseline",
+      "db_name": "CIFAR10_DIRICHLET_a0p5",
+      "elapsed_seconds": 8.01600000000326,
+      "rc": 0,
+      "mia_output": "results\\phase34\\mia_phase34_baseline_a0p5.json",
+      "per_client": {
+        "loss": {
+          "c1": 0.5532524999999999,
+          "c2": 0.7025855000000001,
+          "c3": 0.697212,
+          "mean": 0.6510166666666667,
+          "min": 0.5532524999999999,
+          "max": 0.7025855000000001
+        },
+        "modent": {
+          "c1": 0.5511785,
+          "c2": 0.7016175,
+          "c3": 0.6958375,
+          "mean": 0.6495445000000001,
+          "min": 0.5511785,
+          "max": 0.7016175
+        }
+      },
+      "aggregate_reference": {
+        "loss": 0.4415125,
+        "modent": 0.44324474474474473
+      }
+    },
+    {
+      "alpha": 0.5,
+      "tag": "0p5",
+      "type": "unlearned_class_pruning_p05_ft2",
+      "db_name": "CIFAR10_DIRICHLET_a0p5_UNLEARNED_class_pruning_p05_ft2",
+      "elapsed_seconds": 8.01600000000326,
+      "rc": 0,
+      "mia_output": "results\\phase34\\mia_phase34_class_pruning_p05_ft2_a0p5.json",
+      "per_client": {
+        "loss": {
+          "c1": 0.5532524999999999,
+          "c2": 0.7025855000000001,
+          "c3": 0.697212,
+          "mean": 0.6510166666666667,
+          "min": 0.5532524999999999,
+          "max": 0.7025855000000001
+        },
+        "modent": {
+          "c1": 0.5511785,
+          "c2": 0.7016175,
+          "c3": 0.6958375,
+          "mean": 0.6495445000000001,
+          "min": 0.5511785,
+          "max": 0.7016175
+        }
+      },
+      "aggregate_reference": {
+        "loss": 0.609964,
+        "modent": 0.6099979999999999
+      }
+    },
+    {
+      "alpha": 0.1,
+      "tag": "0p1",
+      "type": "baseline",
+      "db_name": "CIFAR10_DIRICHLET_a0p1",
+      "elapsed_seconds": 7.655999999995402,
+      "rc": 0,
+      "mia_output": "results\\phase34\\mia_phase34_baseline_a0p1.json",
+      "per_client": {
+        "loss": {
+          "c1": 0.36813500000000005,
+          "c2": 0.409436,
+          "c3": 0.65221,
+          "mean": 0.47659366666666664,
+          "min": 0.36813500000000005,
+          "max": 0.65221
+        },
+        "modent": {
+          "c1": 0.356291,
+          "c2": 0.400747,
+          "c3": 0.6324615,
+          "mean": 0.46316650000000004,
+          "min": 0.356291,
+          "max": 0.6324615
+        }
+      },
+      "aggregate_reference": {
+        "loss": 0.27505799999999997,
+        "modent": 0.293375
+      }
+    },
+    {
+      "alpha": 0.1,
+      "tag": "0p1",
+      "type": "unlearned_class_pruning_p05_ft2",
+      "db_name": "CIFAR10_DIRICHLET_a0p1_UNLEARNED_class_pruning_p05_ft2",
+      "elapsed_seconds": 7.655999999995402,
+      "rc": 0,
+      "mia_output": "results\\phase34\\mia_phase34_class_pruning_p05_ft2_a0p1.json",
+      "per_client": {
+        "loss": {
+          "c1": 0.36813500000000005,
+          "c2": 0.409436,
+          "c3": 0.65221,
+          "mean": 0.47659366666666664,
+          "min": 0.36813500000000005,
+          "max": 0.65221
+        },
+        "modent": {
+          "c1": 0.356291,
+          "c2": 0.400747,
+          "c3": 0.6324615,
+          "mean": 0.46316650000000004,
+          "min": 0.356291,
+          "max": 0.6324615
+        }
+      },
+      "aggregate_reference": {
+        "loss": 0.6495099999999999,
+        "modent": 0.649502
+      }
+    }
+  ]
+}

@@ -2,8 +2,10 @@
 import os
 from typing import Optional
 
+import sample_ids
 import torch
-from torch.utils.data import DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
 import numpy as np
 
@@ -50,6 +52,62 @@ def _find_split_dir(root: str, candidates):
         if os.path.isdir(candidate):
             return candidate
     return None
+
+
+def _extract_targets(dataset) -> list:
+    """Extract integer labels for every sample. Uses ``.targets`` when available
+    (torchvision MNIST/CIFAR/FashionMNIST/ImageFolder), falling back to a full
+    iteration as a last resort."""
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        return [int(dataset[i][1]) for i in range(len(dataset))]
+    if isinstance(targets, torch.Tensor):
+        return targets.tolist()
+    return [int(t) for t in targets]
+
+
+def _dirichlet_partition_indices(
+    dataset, num_clients: int, alpha: float, seed: int
+) -> list:
+    """Per-class Dirichlet(α) label-skew partitioning.
+
+    For each class c, draw proportions ``p_c ~ Dirichlet(α, ..., α)`` over
+    ``num_clients`` and allocate that class's samples accordingly. Smaller α →
+    more skew (each class concentrates on few clients). α → ∞ approaches IID.
+
+    Allocation is disjoint (every sample goes to exactly one client), so total
+    coverage matches a horizontal split. Determined by ``seed``.
+    """
+    if alpha <= 0:
+        raise ValueError(f"dirichlet_alpha must be > 0, got {alpha}")
+    rng = np.random.default_rng(seed)
+    targets = _extract_targets(dataset)
+
+    by_class: dict = {}
+    for i, y in enumerate(targets):
+        by_class.setdefault(int(y), []).append(i)
+
+    client_indices = [[] for _ in range(num_clients)]
+    for cls in sorted(by_class):
+        cls_indices = np.array(by_class[cls], dtype=np.int64)
+        rng.shuffle(cls_indices)
+        proportions = rng.dirichlet([alpha] * num_clients)
+        cuts = (np.cumsum(proportions) * len(cls_indices)).astype(int)[:-1]
+        splits = np.split(cls_indices, cuts)
+        for k, split in enumerate(splits):
+            client_indices[k].extend(int(x) for x in split.tolist())
+
+    for k in range(num_clients):
+        rng.shuffle(client_indices[k])
+
+    empty_clients = [k for k, ix in enumerate(client_indices) if len(ix) == 0]
+    if empty_clients:
+        print(
+            f"[load_data] WARNING: Dirichlet(α={alpha}) left clients {empty_clients} "
+            f"with zero samples. Consider raising α or reducing num_clients."
+        )
+
+    return client_indices
 
 
 def _make_vertical_masks(
@@ -109,46 +167,67 @@ class ClassBasedDataset(torch.utils.data.Dataset):
 
 class ImbalancedClassDataset(torch.utils.data.Dataset):
     """Dataset with imbalanced class distribution per client.
-    
-    Each client gets:
-    - 85% of their primary class
-    - 5% of each other class
+
+    Each client takes ``primary_share`` of its primary class's samples plus
+    ``secondary_share`` of every other class's samples. Defaults reproduce the
+    legacy 85% / 5% split. Setting ``secondary_share=0`` yields a pure-class
+    client (no samples from other classes — used to probe class collapse).
     """
-    def __init__(self, base_dataset, client_id: int, num_clients: int, num_classes: int, seed: int = 42):
+    def __init__(
+        self,
+        base_dataset,
+        client_id: int,
+        num_clients: int,
+        num_classes: int,
+        seed: Optional[int] = None,
+        primary_share: float = 0.85,
+        secondary_share: float = 0.05,
+    ):
+        if seed is None:
+            seed = sample_ids.IMBALANCED_CLASS_PARTITION_SEED
+        if not 0.0 <= primary_share <= 1.0:
+            raise ValueError(f"primary_share must be in [0, 1], got {primary_share}")
+        if not 0.0 <= secondary_share <= 1.0:
+            raise ValueError(f"secondary_share must be in [0, 1], got {secondary_share}")
         self.base = base_dataset
         self.client_id = client_id
         self.num_clients = num_clients
         self.num_classes = num_classes
-        
+        self.primary_share = primary_share
+        self.secondary_share = secondary_share
+
         # Assign primary class to client (client 0 -> class 0, client 1 -> class 1, etc.)
         primary_class = client_id % num_classes
-        
+
         # Collect all samples grouped by class
         class_indices = {cls: [] for cls in range(num_classes)}
         for i in range(len(base_dataset)):
             _, label = base_dataset[i]
             class_indices[int(label)].append(i)
-        
-        # Create imbalanced split: 85% primary, 5% each other class
+
+        # Create imbalanced split per primary_share / secondary_share
         self.indices = []
-        
+
         # Use a generator with seed for reproducibility
         import random
         rng = random.Random(seed + client_id)
-        
-        # Get 85% of primary class
+
+        # Take primary_share of primary class
         primary_class_indices = class_indices[primary_class].copy()
         rng.shuffle(primary_class_indices)
-        primary_count = int(len(primary_class_indices) * 0.85)
+        primary_count = int(len(primary_class_indices) * primary_share)
         self.indices.extend(primary_class_indices[:primary_count])
-        
-        # Get 5% of each other class
+
+        # Take secondary_share of each other class (0 means take none — pure-class client)
         for cls in range(num_classes):
-            if cls != primary_class:
-                other_class_indices = class_indices[cls].copy()
-                rng.shuffle(other_class_indices)
-                other_count = max(1, int(len(other_class_indices) * 0.05))  # At least 1 sample
-                self.indices.extend(other_class_indices[:other_count])
+            if cls == primary_class:
+                continue
+            if secondary_share <= 0.0:
+                continue
+            other_class_indices = class_indices[cls].copy()
+            rng.shuffle(other_class_indices)
+            other_count = max(1, int(len(other_class_indices) * secondary_share))
+            self.indices.extend(other_class_indices[:other_count])
         
         # Shuffle all indices together
         rng.shuffle(self.indices)
@@ -182,19 +261,37 @@ def load_data(
     dataset_path: Optional[str] = None,
     img_size: Optional[int] = None,
     num_channels: Optional[int] = None,
+    partition_seed: int = None,
+    dirichlet_alpha: Optional[float] = None,
+    primary_share: float = 0.85,
+    secondary_share: float = 0.05,
 ):
     """
     Load and split dataset for federated learning.
-    
+
     Args:
         dataset_name: Built-in dataset name or "CUSTOM" for ImageFolder inputs.
         num_clients: Number of client partitions.
         batch_size: Batch size for data loaders.
-        partition_type: "horizontal" (default), "vertical" (feature-based), or "class_vertical" (class-based).
+        partition_type: "horizontal" (default, IID random split), "vertical"
+            (feature-mask), "class_vertical" (per-client class imbalance,
+            controlled by ``primary_share`` / ``secondary_share``), or
+            "dirichlet" (per-class Dirichlet(α) label-skew, controlled by
+            ``dirichlet_alpha``).
         dataset_path: Root folder for custom datasets (expects train/ and val/).
         img_size: Target square resolution (required for custom datasets).
         num_channels: Number of channels (required for custom datasets).
-        
+        partition_seed: RNG seed for horizontal random_split AND dirichlet
+            sampling. Stable across runs to keep global sample ids reproducible.
+        dirichlet_alpha: Concentration for ``partition_type="dirichlet"``.
+            Smaller → more label skew (e.g. 0.1 ≈ extreme non-IID); larger →
+            closer to IID (e.g. 1000 ≈ horizontal). Required when
+            ``partition_type="dirichlet"``.
+        primary_share: Per-client share of the client's primary class for
+            ``class_vertical`` (default 0.85, the legacy value).
+        secondary_share: Per-client share of every non-primary class for
+            ``class_vertical`` (default 0.05). Set to 0 for pure-class clients.
+
     Returns:
         List of DataLoaders (train), one for each client, and a single test DataLoader.
     """
@@ -257,6 +354,9 @@ def load_data(
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
+    if partition_seed is None:
+        partition_seed = sample_ids.DEFAULT_PARTITION_SEED
+    
     if partition_type == "vertical":
         if dataset_key == "CUSTOM" and (num_channels is None or img_size is None):
             raise ValueError("Vertical partitioning for CUSTOM datasets requires --img-size and --num-channels")
@@ -271,12 +371,8 @@ def load_data(
             MaskedDataset(dataset, post_transform=FeatureMaskTransform(mask))
             for mask in masks
         ]
-        client_loaders = [
-            DataLoader(ds, batch_size=batch_size, shuffle=True)
-            for ds in client_datasets
-        ]
     elif partition_type == "class_vertical":
-        # Each client gets imbalanced distribution: 85% of primary class, 5% of each other class
+        # Each client gets imbalanced distribution per (primary_share, secondary_share).
         # First, determine available classes
         if hasattr(dataset, 'classes'):
             # ImageFolder dataset
@@ -288,36 +384,48 @@ def load_data(
             unique_labels = sorted(set(all_labels))
             num_classes = len(unique_labels)
             class_names = [f"Class {i}" for i in unique_labels]
-        
+
         if num_clients > num_classes:
             raise ValueError(f"Number of clients ({num_clients}) cannot exceed number of classes ({num_classes}) for class_vertical partitioning")
-        
-        # Create imbalanced datasets: 85% primary class, 5% each other class
+
         client_datasets = []
         for client_id in range(num_clients):
             client_dataset = ImbalancedClassDataset(
-                dataset, 
+                dataset,
                 client_id=client_id,
                 num_clients=num_clients,
                 num_classes=num_classes,
-                seed=42  # Fixed seed for reproducibility
+                seed=sample_ids.IMBALANCED_CLASS_PARTITION_SEED,
+                primary_share=primary_share,
+                secondary_share=secondary_share,
             )
             client_datasets.append(client_dataset)
-        
-        client_loaders = [
-            DataLoader(ds, batch_size=batch_size, shuffle=True)
-            for ds in client_datasets
-        ]
+    elif partition_type == "dirichlet":
+        if dirichlet_alpha is None:
+            raise ValueError(
+                "partition_type='dirichlet' requires dirichlet_alpha (e.g. 0.1, 1.0, 10.0)."
+            )
+        indices_per_client = _dirichlet_partition_indices(
+            dataset, num_clients, float(dirichlet_alpha), int(partition_seed)
+        )
+        client_datasets = [Subset(dataset, idx) for idx in indices_per_client]
     else:
-        # Horizontal: equal random split of samples
+        # Horizontal: equal random split of samples (seeded for stable global sample ids)
         total_size = len(dataset)
         client_sizes = [total_size // num_clients] * num_clients
         client_sizes[-1] += total_size - sum(client_sizes)  # Handle remainder
-        client_datasets = random_split(dataset, client_sizes)
-        client_loaders = [
-            DataLoader(ds, batch_size=batch_size, shuffle=True)
-            for ds in client_datasets
-        ]
+        g = torch.Generator()
+        g.manual_seed(int(partition_seed))
+        client_datasets = random_split(dataset, client_sizes, generator=g)
+    
+    client_datasets = [
+        sample_ids.WithSampleIds(ds, sample_ids.get_global_index_map(ds))
+        for ds in client_datasets
+    ]
+    client_loaders = [
+        DataLoader(ds, batch_size=batch_size, shuffle=True)
+        for ds in client_datasets
+    ]
     
     # Test dataset
     if dataset_key == "MNIST":
@@ -350,15 +458,40 @@ def load_data(
     return client_loaders, test_loader
 
 
-def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing=0.1):
+def _total_grad_norm(parameters):
+    """L2 norm of gradients over all parameters (per-sample gradient norm)."""
+    total = 0.0
+    for p in parameters:
+        if p.grad is not None:
+            total += float(p.grad.detach().data.pow(2).sum().item())
+    return total ** 0.5
+
+
+def train_epoch(
+    net,
+    trainloader,
+    device,
+    epochs=1,
+    debug=False,
+    label_smoothing=0.1,
+    sample_ids_accumulator=None,
+    training_stats=None,
+    per_sample_grad_norms=False,
+):
     """Train the model for one or more epochs.
     
     Args:
         label_smoothing: Label smoothing factor (0.0 = no smoothing, 0.1 = recommended for single-class clients)
                          This prevents overconfidence when clients only see one class.
+        sample_ids_accumulator: If provided, extend with each batch's global sample ids in **iteration order**
+            (includes duplicates across batches if any; use ``training_stats`` for batch structure).
+        training_stats: If provided, must be a dict; it is filled with:
+            ``batches`` (ordered list of per-batch sample-id lists, reflecting DataLoader shuffle),
+            ``per_sample_loss`` (flat list of ``{sample_id, loss}`` in iteration order),
+            and optionally ``per_sample_grad_norm`` (same shape when ``per_sample_grad_norms`` is True).
+        per_sample_grad_norms: If True, run one backward per example in each batch to record grad norms,
+            then a second forward/backward for the optimizer step (expensive).
     """
-    # Use label smoothing to prevent overconfidence when clients only see one class
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     
     # Use different learning rates for feature extractor vs classifier
     # Lower LR for final layer to prevent it from becoming too confident
@@ -397,16 +530,45 @@ def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing
     # Gradient clipping to prevent explosion
     max_grad_norm = 1.0
     
+    if per_sample_grad_norms and training_stats is None:
+        training_stats = {"batches": [], "per_sample_loss": [], "per_sample_grad_norm": []}
+    if training_stats is not None:
+        training_stats.setdefault("batches", [])
+        training_stats.setdefault("per_sample_loss", [])
+        if per_sample_grad_norms:
+            training_stats.setdefault("per_sample_grad_norm", [])
+    
     net.train()
     total_batches = len(trainloader)
     for epoch in range(epochs):
         running_loss = 0.0
-        for batch_idx, (images, labels) in enumerate(trainloader):
-            images, labels = images.to(device), labels.to(device)
+        for batch_idx, batch in enumerate(trainloader):
+            if len(batch) == 3:
+                images, labels, sample_id_batch = batch
+                images, labels = images.to(device), labels.to(device)
+                sids = sample_id_batch.detach().cpu().tolist()
+                if sample_ids_accumulator is not None:
+                    sample_ids_accumulator.extend(sids)
+            else:
+                images, labels = batch
+                images, labels = images.to(device), labels.to(device)
+                sids = None
+            
+            if training_stats is not None and sids is None:
+                raise ValueError(
+                    "training_stats / per-sample metrics require DataLoader batches with sample ids "
+                    "(image, label, global_sample_id); enable WithSampleIds in load_data."
+                )
+            
             optimizer.zero_grad()
             
             # Forward pass - get raw logits (no softmax)
             outputs = net(images)
+            
+            # Per-example loss (same math as mean CE used for the optimizer step)
+            loss_vec = F.cross_entropy(
+                outputs, labels, label_smoothing=label_smoothing, reduction="none"
+            )
             
             # Debug: Log first batch statistics
             if debug and batch_idx == 0:
@@ -435,8 +597,36 @@ def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing
                     print(f"  ⚠️  WARNING: Batch contains only ONE class ({unique_labels[0].item()})!")
                 print(f"  {'='*50}\n")
             
-            # CrossEntropyLoss applies softmax internally - this is correct
-            loss = criterion(outputs, labels)
+            if training_stats is not None:
+                training_stats["batches"].append([int(x) for x in sids])
+                lv = loss_vec.detach().cpu()
+                for j, sid in enumerate(sids):
+                    training_stats["per_sample_loss"].append(
+                        {"sample_id": int(sid), "loss": float(lv[j].item())}
+                    )
+            
+            if per_sample_grad_norms:
+                norms = []
+                bsz = images.size(0)
+                for j in range(bsz):
+                    optimizer.zero_grad()
+                    loss_vec[j].backward(retain_graph=(j < bsz - 1))
+                    norms.append(_total_grad_norm(net.parameters()))
+                if training_stats is not None:
+                    for j, sid in enumerate(sids):
+                        training_stats["per_sample_grad_norm"].append(
+                            {"sample_id": int(sid), "grad_norm": float(norms[j])}
+                        )
+                optimizer.zero_grad()
+                # Second forward at the same weights for the actual SGD step (graph was freed)
+                outputs = net(images)
+                loss_vec = F.cross_entropy(
+                    outputs, labels, label_smoothing=label_smoothing, reduction="none"
+                )
+                loss = loss_vec.mean()
+            else:
+                loss = loss_vec.mean()
+            
             loss.backward()
             
             # Gradient clipping
@@ -444,9 +634,11 @@ def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing
             
             # Debug: Log gradients after first batch
             if debug and batch_idx == 0:
-                from comprehensive_diagnostics import log_gradient_norms_detailed
-                # Note: client_id and round_num not available here, use placeholder
-                grad_norms = log_gradient_norms_detailed(net, round_num=0, client_id=-1)
+                try:
+                    from Information.comprehensive_diagnostics import log_gradient_norms_detailed
+                except ImportError:
+                    from Information.comprehensive_diagnostics import log_gradient_norms_detailed
+                log_gradient_norms_detailed(net, round_num=0, client_id=-1)
                 
                 # Verify optimizer will actually update
                 has_grads = any(p.grad is not None and p.grad.abs().sum() > 0 for p in net.parameters())
@@ -454,7 +646,7 @@ def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing
                     print(f"  ⚠️  CRITICAL: No valid gradients found! Optimizer step() will not update parameters!")
             
             optimizer.step()
-            running_loss += loss.item()
+            running_loss += float(loss.detach().item())
             
             # Log progress every 10% of batches
             if (batch_idx + 1) % max(1, total_batches // 10) == 0 or (batch_idx + 1) == total_batches:
@@ -466,28 +658,38 @@ def train_epoch(net, trainloader, device, epochs=1, debug=False, label_smoothing
 
 
 def test(net, testloader, device):
-    """Evaluate the model on test data."""
+    """Evaluate the model on test data.
+
+    Accepts loaders that yield either ``(image, label)`` or
+    ``(image, label, global_sample_id)`` batches — sample IDs are ignored when
+    present, so this works with both vanilla torchvision loaders and the
+    ``WithSampleIds``-wrapped loaders used by the unlearning + MIA pipelines.
+    """
     criterion = torch.nn.CrossEntropyLoss()
     correct, total, loss = 0, 0, 0.0
     net.eval()
-    
+
     total_batches = len(testloader)
     print(f"  Evaluating on {total_batches} test batches...")
-    
+
     with torch.no_grad():
-        for batch_idx, (images, labels) in enumerate(testloader):
+        for batch_idx, batch in enumerate(testloader):
+            if len(batch) == 3:
+                images, labels, _ = batch
+            else:
+                images, labels = batch
             images, labels = images.to(device), labels.to(device)
             outputs = net(images)
             loss += criterion(outputs, labels).item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            
+
             # Log progress every 25% of batches
             if (batch_idx + 1) % max(1, total_batches // 4) == 0 or (batch_idx + 1) == total_batches:
                 progress = 100.0 * (batch_idx + 1) / total_batches
                 print(f"  Evaluation progress: {progress:.1f}% ({batch_idx + 1}/{total_batches} batches)")
-    
+
     accuracy = correct / total
     loss = loss / len(testloader)
     return loss, accuracy

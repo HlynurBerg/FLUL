@@ -15,6 +15,10 @@ def run_server(
     img_size=None,
     num_channels=None,
     num_classes=None,
+    partition_type="horizontal",
+    dirichlet_alpha=None,
+    primary_share=0.85,
+    secondary_share=0.05,
 ):
     """Run the Flower server."""
     print("Starting Flower server...")
@@ -26,10 +30,17 @@ def run_server(
             dataset,
             "--model",
             model_name,
+            "--partition-type",
+            partition_type,
             *([] if dataset_path is None else ["--dataset-path", dataset_path]),
             *([] if img_size is None else ["--img-size", str(img_size)]),
             *([] if num_channels is None else ["--num-channels", str(num_channels)]),
             *([] if num_classes is None else ["--num-classes", str(num_classes)]),
+            *([] if dirichlet_alpha is None else ["--dirichlet-alpha", str(dirichlet_alpha)]),
+            "--primary-share",
+            str(primary_share),
+            "--secondary-share",
+            str(secondary_share),
         ]
     )
 
@@ -45,6 +56,9 @@ def run_client(
     num_channels=None,
     num_classes=None,
     partition_type="horizontal",
+    dirichlet_alpha=None,
+    primary_share=0.85,
+    secondary_share=0.05,
 ):
     """Run a Flower client."""
     print(f"Starting Flower client {client_id}...")
@@ -66,6 +80,11 @@ def run_client(
             *([] if img_size is None else ["--img-size", str(img_size)]),
             *([] if num_channels is None else ["--num-channels", str(num_channels)]),
             *([] if num_classes is None else ["--num-classes", str(num_classes)]),
+            *([] if dirichlet_alpha is None else ["--dirichlet-alpha", str(dirichlet_alpha)]),
+            "--primary-share",
+            str(primary_share),
+            "--secondary-share",
+            str(secondary_share),
         ]
     )
 
@@ -132,8 +151,26 @@ def main():
         "--partition-type",
         type=str,
         default="horizontal",
-        choices=["horizontal", "vertical"],
+        choices=["horizontal", "vertical", "class_vertical", "dirichlet"],
         help="Partition type when launching via app.py (client mode).",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=None,
+        help="Dirichlet concentration (required when --partition-type=dirichlet).",
+    )
+    parser.add_argument(
+        "--primary-share",
+        type=float,
+        default=0.85,
+        help="class_vertical primary-class share (default 0.85).",
+    )
+    parser.add_argument(
+        "--secondary-share",
+        type=float,
+        default=0.05,
+        help="class_vertical secondary-class share (default 0.05).",
     )
     
     args = parser.parse_args()
@@ -146,6 +183,10 @@ def main():
             img_size=args.img_size,
             num_channels=args.num_channels,
             num_classes=args.num_classes,
+            partition_type=args.partition_type,
+            dirichlet_alpha=args.dirichlet_alpha,
+            primary_share=args.primary_share,
+            secondary_share=args.secondary_share,
         )
     elif args.mode == "client":
         run_client(
@@ -158,6 +199,9 @@ def main():
             num_channels=args.num_channels,
             num_classes=args.num_classes,
             partition_type=args.partition_type,
+            dirichlet_alpha=args.dirichlet_alpha,
+            primary_share=args.primary_share,
+            secondary_share=args.secondary_share,
         )
     elif args.mode == "demo":
         print("Running demo mode - starting server and 3 clients...")

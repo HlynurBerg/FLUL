@@ -1,4 +1,11 @@
-"""Script to test unlearning algorithms on a preserved original model."""
+"""Script to test unlearning algorithms on a preserved original model.
+
+NOTE: this file is a CLI-style helper script, not a pytest module. It happens
+to live with a ``test_`` prefix because of legacy naming, but its functions
+require positional/CLI arguments rather than pytest fixtures. The
+``__test__ = False`` markers below tell pytest to skip collection so the
+module doesn't break ``pytest test_unlearning_*.py`` runs.
+"""
 import argparse
 import pickle
 from pathlib import Path
@@ -8,7 +15,13 @@ import numpy as np
 from contributions_db import ContributionDB
 from unlearning import GradientBasedUnlearning, InfluenceFunctionBasedUnlearning
 from model import create_model, set_parameters, get_parameters
-from utils import load_data, test
+# Rename to avoid pytest collecting the imported function as a test.
+from utils import load_data, test as utils_test
+
+# pytest sees any top-level callable named ``test*`` as a test target — these
+# markers tell it to skip the script-style helpers in this module.
+test = utils_test
+test.__test__ = False  # mark the rebound utils.test() so pytest skips it
 
 
 def list_available_datasets(base_dir="contributions"):
@@ -430,6 +443,10 @@ def test_unlearning_algorithm(
     print(f"{'='*70}\n")
     
     return results
+
+
+# Tell pytest this CLI helper is not a fixture-driven test.
+test_unlearning_algorithm.__test__ = False
 
 
 def compare_algorithms_on_original(

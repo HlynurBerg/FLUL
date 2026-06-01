@@ -1,4 +1,75 @@
-# DISCLAIMER: Code comments and installation instruction is written partially using AI
+# DISCLAIMER: Code, code comments and README are written partially using AI
+AI has been used during this project. Main uses are:
+Tab completions, Automatic comment generation for completed functions, Partially generated orchestrators to avoid CLI instructions for reproducibility, Agentic Lean, Rubber ducking.
+
+# FLUL — Federated Learning Unlearning
+
+Master's thesis codebase: federated unlearning under a unified empirical /
+formal-verification framing. Two complementary tracks share this
+repository:
+
+- **Empirical track** — five federated unlearning algorithms compared via
+  membership-inference attacks (MIA) across IID and Dirichlet-non-IID
+  regimes on CIFAR-10 + ResNet-18. Framework code lives at the repo root
+  (`server.py`, `client.py`, `unlearning.py`, `mia*.py`); the per-phase
+  drivers `run_phase_*.py` live in [`orchestrators/`](orchestrators/).
+- **Formal track** — four theorems machine-checked in Lean 4 + mathlib4 (`theory/`,
+  ~1400 lines, zero `sorry`/`axiom` outside mathlib).
+- **Bridge experiments** — `orchestrators/run_e{1,2,2b,3}_*.py` (numpy
+  only) empirically validate the scalar instances of the four theorems,
+  with summaries in `summaries/e*_summary.json`.
+
+## Orchestrator scripts
+
+All `run_*` scripts (the per-phase orchestrators `run_phase_*.py`, the
+bridge experiments `run_e*_*.py`, plus `run_training.py` and the LiRA
+driver) live in [`orchestrators/`](orchestrators/) to keep the repo root
+navigable.
+
+**To run one, move it back to the repo root first.** The scripts are kept
+verbatim: they import sibling modules (`utils`, `mia`, `model`,
+`retrain_baseline`, `sample_ids`, …) and shell out to `server.py` /
+`client.py` by relative path, both of which resolve only when the script
+sits at the repo root next to those modules. For example:
+
+```bash
+cp orchestrators/run_phase_11.py .   # then run, then delete the copy
+"venv/Scripts/python.exe" run_phase_11.py
+```
+
+The same rule applies to the standalone scripts in
+[`tools/`](tools/) (plotting, contribution viewing, re-aggregation,
+benchmarking): the `plot_*` and `merge_*` helpers read summary JSON and
+run from anywhere, but any tool that imports a framework module
+(`view_contributions.py`, `reaggregate_excluding_client.py`,
+`influence_replay.py`, `benchmark_unlearning.py`, `visualize_metrics.py`)
+must be copied to the repo root to run.
+
+Tests live in [`tests/`](tests/) and import the framework modules, so run
+them from the repo root with the module flag (which puts the root on the
+import path):
+
+```bash
+"venv/Scripts/python.exe" -m pytest tests/
+```
+
+## Cold-start commands
+
+```bash
+# Bridge experiments (numpy only) — move to root first, see above
+cp orchestrators/run_e1_linear_regression.py .
+"venv/Scripts/python.exe" run_e1_linear_regression.py
+
+# Lean proofs (~5 s once mathlib cache is warm)
+cd theory && "C:/Users/Hlynur/.elan/bin/lake.exe" build
+
+# Full FLUL framework — see "Federated Learning Testing Environment" below
+pip install -r requirements.txt
+cp orchestrators/run_phase_11.py .   # any run_phase_*.py
+"venv/Scripts/python.exe" run_phase_11.py
+```
+
+---
 
 # Federated Learning Testing Environment with Flower
 
@@ -161,7 +232,6 @@ python client.py --client-id 0 --num-clients 4 \
 ### Larger Models & External Checkpoints
 
 - Start with `--model resnet18` on `--dataset CIFAR10` to benchmark a deeper architecture better suited for higher-resolution inputs.
-- If you need to sideload checkpoints that cannot be downloaded programmatically, place them under `models/pretrained/` (see `models/README.md`) and update the training scripts to load them before federated rounds begin.
 - For datasets with images larger than 32×32 (e.g., 224×224), pass `--img-size 224 --num-channels 3` and pair them with `--model resnet18` so the ImageNet-style stem is used automatically.
 
 ### Custom High-Resolution Datasets
@@ -244,10 +314,21 @@ FLUL/
 ├── server.py               # Flower server implementation
 ├── client.py               # Flower client implementation
 ├── model.py                # Neural network model definition
-├── utils.py                # Utility functions for data loading and training
+├── utils.py                # Data loading and training utilities
+├── unlearning.py           # Unlearning algorithm implementations
 ├── contributions_db.py     # Contribution database for tracking client contributions
-├── view_contributions.py   # Script to view and analyze contributions
-├── manage_withdrawals.py   # Tool to manage client withdrawals and recalculate models
+├── manage_withdrawals.py   # Client/sample withdrawal + recalculation
+├── retrain_baseline.py     # Exact-retrain reference for unlearning
+├── sample_ids.py           # Stable global sample-id mapping + partition seeds
+├── mia.py                  # Membership-inference attack
+├── mia_eval_sets.py        # MIA member/non-member set construction
+├── mia_shadow.py           # Shadow-model training for LiRA
+├── evaluate_mia*.py        # MIA evaluation entry points (per-round/per-client)
+├── orchestrators/          # All run_* scripts (copy to root to run — see above)
+├── tools/                  # Plotting + analysis/admin scripts (run from root)
+├── tests/                  # pytest suite (run: python -m pytest tests/)
+├── summaries/              # Per-phase *_summary.json reproducibility records
+├── theory/                 # Lean 4 + mathlib formalisation
 ├── requirements.txt        # Python dependencies
 └── README.md               # This file
 ```
@@ -273,9 +354,12 @@ contributions/
 
 ### Viewing Contributions
 
-Use the `view_contributions.py` script to analyze contributions:
+Use the `view_contributions.py` script to analyze contributions. It lives
+in `tools/`; copy it to the repo root first (it imports `contributions_db`):
 
 ```bash
+cp tools/view_contributions.py .
+
 # View all contributions
 python view_contributions.py --dataset MNIST
 

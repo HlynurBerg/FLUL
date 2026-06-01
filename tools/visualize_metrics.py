@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+
+from contributions_db import load_contribution_metadata_file
 from typing import Dict, List, Tuple, Optional
 
 
@@ -89,8 +91,7 @@ def _load_client_contributions(contrib_root: Path) -> List[Dict]:
         for client_dir in d.iterdir():
             if client_dir.is_dir() and client_dir.name.startswith("client_"):
                 for meta in client_dir.glob("*_metadata.json"):
-                    with open(meta, "r") as f:
-                        contributions.append(json.load(f))
+                    contributions.append(load_contribution_metadata_file(meta))
     # Sort by round then timestamp
     contributions.sort(key=lambda x: (x.get("round", 0), x.get("timestamp", "")))
     return contributions

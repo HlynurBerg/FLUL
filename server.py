@@ -60,8 +60,26 @@ def main():
         "--partition-type",
         type=str,
         default="horizontal",
-        choices=["horizontal", "vertical", "class_vertical"],
+        choices=["horizontal", "vertical", "class_vertical", "dirichlet"],
         help="Partition type (for contribution database naming)",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=None,
+        help="Dirichlet concentration for partition_type=dirichlet (DB-naming only on the server; the per-client partitioning happens in client.py).",
+    )
+    parser.add_argument(
+        "--primary-share",
+        type=float,
+        default=0.85,
+        help="class_vertical primary-class share (DB-naming only on server; default 0.85).",
+    )
+    parser.add_argument(
+        "--secondary-share",
+        type=float,
+        default=0.05,
+        help="class_vertical secondary-class share (DB-naming only on server; default 0.05).",
     )
     parser.add_argument(
         "--exclude-clients",
@@ -74,6 +92,24 @@ def main():
         type=str,
         default=None,
         help="Suffix to add to contribution database name for retrained models (e.g., 'RETRAINED_012' to exclude client 3)",
+    )
+    parser.add_argument(
+        "--init-weights-from-dataset",
+        type=str,
+        default=None,
+        help="DB subdir under contributions/ to warm-start from (e.g., 'CIFAR10_UNLEARNED_class_pruning_p05_ft2'). Loads the newest aggregate at --init-weights-from-round and uses it as the initial global model.",
+    )
+    parser.add_argument(
+        "--init-weights-from-round",
+        type=int,
+        default=None,
+        help="Round number to load the warm-start aggregate from. Required when --init-weights-from-dataset is set.",
+    )
+    parser.add_argument(
+        "--first-round-offset",
+        type=int,
+        default=0,
+        help="Added to server_round when writing per-round contributions and aggregates. Used to preserve global round numbering when continuing FL training from a warm-started checkpoint (e.g., offset=K means server round 1 is saved as DB round K+1).",
     )
     args = parser.parse_args()
     
@@ -111,11 +147,23 @@ def main():
         num_channels=args.num_channels,
     )
     
-    # Initialize contribution database
-    # For class_vertical partitioning, use a different dataset name to save separately
+    # Initialize contribution database. Auto-suffix the DB name per partitioning
+    # so different sweep configurations don't overwrite each other.
     if args.partition_type == "class_vertical":
         db_dataset_name = f"{dataset_name}_CLASS_VERTICAL"
+        # Only append a share suffix when non-default values are used (preserves
+        # backward compatibility with existing DBs at 0.85/0.05).
+        if not (abs(args.primary_share - 0.85) < 1e-9 and abs(args.secondary_share - 0.05) < 1e-9):
+            p_tag = f"{args.primary_share:.2f}".rstrip("0").rstrip(".")
+            s_tag = f"{args.secondary_share:.2f}".rstrip("0").rstrip(".")
+            db_dataset_name = f"{db_dataset_name}_p{p_tag}_s{s_tag}"
         print(f"[Server] Using class-based vertical partitioning - contributions saved separately as '{db_dataset_name}'")
+    elif args.partition_type == "dirichlet":
+        if args.dirichlet_alpha is None:
+            raise ValueError("--dirichlet-alpha is required when --partition-type=dirichlet")
+        a_tag = f"{args.dirichlet_alpha:g}".replace(".", "p")
+        db_dataset_name = f"{dataset_name}_DIRICHLET_a{a_tag}"
+        print(f"[Server] Using Dirichlet(α={args.dirichlet_alpha}) partitioning - contributions saved separately as '{db_dataset_name}'")
     else:
         db_dataset_name = dataset_name
     
@@ -126,6 +174,30 @@ def main():
     
     contribution_db = ContributionDB(dataset_name=db_dataset_name)
     print(f"[Server] Contribution database initialized: {contribution_db.contributions_dir}")
+
+    # Warm-start: replace freshly-initialised net's params with the aggregate
+    # from a prior run before saving initial_global_params. The MIA/replay layer
+    # treats initial_global_params as the "start of round 1" model, so this also
+    # serves as the source for client-side incoming weights.
+    if args.init_weights_from_dataset is not None:
+        if args.init_weights_from_round is None:
+            raise ValueError("--init-weights-from-round is required when --init-weights-from-dataset is set")
+        src_db = ContributionDB(dataset_name=args.init_weights_from_dataset)
+        src_params = src_db.get_latest_aggregated_parameters(args.init_weights_from_round)
+        if src_params is None:
+            raise ValueError(
+                f"No aggregate found at round {args.init_weights_from_round} in "
+                f"'{args.init_weights_from_dataset}' (looked in {src_db.contributions_dir})"
+            )
+        set_parameters(net, src_params)
+        print(
+            f"[Server] Warm-started from {args.init_weights_from_dataset} round "
+            f"{args.init_weights_from_round} (newest aggregate). "
+            f"first_round_offset={args.first_round_offset}"
+        )
+
+    # Incoming weights for round 0 (replay / per-sample gradient recovery)
+    contribution_db.save_initial_global_parameters(get_parameters(net))
     
     # Parse excluded clients
     excluded_client_ids = set()
@@ -145,8 +217,8 @@ def main():
             # Debug: Comprehensive logging (first round and every 5 rounds)
             if server_round == 0 or server_round % 5 == 0:
                 try:
-                    from comprehensive_diagnostics import log_server_logits
-                    from partial_collapse_diagnostics import (
+                    from Information.comprehensive_diagnostics import log_server_logits
+                    from Information.partial_collapse_diagnostics import (
                         check_server_head_capacity,
                         visualize_embeddings_pca
                     )
@@ -185,8 +257,9 @@ def main():
             
             # Save aggregated model with per-class metrics
             metrics = {"loss": float(loss), "accuracy": float(accuracy), **per_class_metrics}
+            db_round = server_round + args.first_round_offset
             contribution_db.save_aggregated_model(
-                round_num=server_round,
+                round_num=db_round,
                 parameters=get_parameters(net),
                 metrics=metrics
             )
@@ -247,25 +320,25 @@ def main():
             # Get the default configuration from parent
             config = super().configure_fit(server_round, parameters, client_manager)
             
-            # Filter out excluded clients if any
+            # Log the in/out client list so excluded clients are visible. The
+            # actual exclusion is enforced in aggregate_fit (post-hoc filter)
+            # plus the lower min_fit_clients setting downstream. Flower 1.22
+            # changed client_manager.all() to return a dict[str, ClientProxy]
+            # rather than a list — handle both shapes safely.
             if excluded_client_ids:
-                # Get available clients
-                available_clients = client_manager.all()
-                
-                # Filter out excluded clients
-                filtered_clients = [
-                    client for client in available_clients
-                    if client.cid not in excluded_client_ids
-                ]
-                
-                # Update client manager's available clients (this is a bit of a hack)
-                # Actually, we need to modify the sampling logic
-                # The best approach is to override the sampling in configure_fit
-                # But Flower's API doesn't make this easy. Instead, we'll filter in aggregate_fit
-                # For now, we'll just log and let the min_available_clients handle it
-                print(f"[Server] Round {server_round}: Available clients: {[c.cid for c in available_clients]}, "
-                      f"Excluding: {sorted(excluded_client_ids)}, "
-                      f"Filtered: {[c.cid for c in filtered_clients]}")
+                available = client_manager.all()
+                if isinstance(available, dict):
+                    available_proxies = list(available.values())
+                else:
+                    available_proxies = list(available)
+                avail_cids = [getattr(c, "cid", str(c)) for c in available_proxies]
+                # Convert excluded ids to strings to match Flower's cid type
+                excluded_str = {str(x) for x in excluded_client_ids}
+                kept = [cid for cid in avail_cids if cid not in excluded_str]
+                print(
+                    f"[Server] Round {server_round}: Available clients: {avail_cids}, "
+                    f"Excluding: {sorted(excluded_client_ids)}, Filtered: {kept}"
+                )
             
             return config
         
@@ -274,8 +347,8 @@ def main():
             # Debug: Comprehensive aggregation analysis (first round and every 5 rounds)
             if (server_round == 0 or server_round % 5 == 0) and results:
                 try:
-                    from debug_training import analyze_aggregated_parameters
-                    from comprehensive_diagnostics import log_aggregation_details
+                    from Information.debug_training import analyze_aggregated_parameters
+                    from Information.comprehensive_diagnostics import log_aggregation_details
                     
                     param_lists = []
                     client_ids = []
@@ -322,7 +395,7 @@ def main():
                         if server_round == 0:
                             try:
                                 import numpy as np
-                                from partial_collapse_diagnostics import check_server_head_capacity
+                                from Information.partial_collapse_diagnostics import check_server_head_capacity
                                 
                                 # Check server head capacity
                                 head_info, needs_capacity = check_server_head_capacity(net)
@@ -448,12 +521,12 @@ def main():
                     try:
                         parameters = fl.common.parameters_to_ndarrays(fit_res.parameters)
                         num_samples = fit_res.num_examples
-                        
-                        print(f"[Server] Saving contribution for client {client_id}: {num_samples} samples, {len(parameters)} parameter arrays")
-                        
+                        db_round = server_round + args.first_round_offset
+                        print(f"[Server] Saving contribution for client {client_id}: {num_samples} samples, {len(parameters)} parameter arrays (db_round={db_round})")
+
                         # Save contribution
                         contribution_db.save_contribution(
-                            round_num=server_round,
+                            round_num=db_round,
                             client_id=client_id,
                             parameters=parameters,
                             num_samples=num_samples,

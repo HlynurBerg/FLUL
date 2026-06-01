@@ -4,11 +4,33 @@ from contributions_db import ContributionDB
 from model import create_model, set_parameters, get_parameters
 from utils import load_data, test
 from unlearning import (
-    GradientBasedUnlearning, 
+    GradientBasedUnlearning,
     InfluenceFunctionBasedUnlearning,
-    evaluate_unlearned_model
+    HessianInfluenceUnlearning,
+    ClassDiscriminativePruningUnlearning,
+    GradientAscentKDUnlearning,
+    evaluate_unlearned_model,
 )
 import torch
+
+
+def parse_sample_ids(s: str):
+    """Comma-separated global sample ids."""
+    if not s or not str(s).strip():
+        return []
+    return [int(x.strip()) for x in str(s).split(",") if x.strip()]
+
+
+def withdraw_samples(db, round_num, client_id, sample_ids, reason=None, contribution_key=None):
+    """Withdraw specific samples from one contribution (latest for round/client unless key given)."""
+    ck = db.resolve_contribution_key(round_num, client_id, contribution_key)
+    return db.withdraw_samples_from_contribution(ck, sample_ids, reason=reason)
+
+
+def restore_samples(db, round_num, client_id, sample_ids=None, all_samples=False, contribution_key=None):
+    """Restore specific or all sample-level withdrawals for a contribution."""
+    ck = db.resolve_contribution_key(round_num, client_id, contribution_key)
+    return db.restore_samples_from_contribution(ck, sample_ids=sample_ids, all_samples=all_samples)
 
 
 def withdraw_client(db, client_id, reason=None):
@@ -66,6 +88,9 @@ def show_history(db, client_id=None, round_num=None):
         status = "WITHDRAWN" if entry["withdrawn"] else "ACTIVE"
         print(f"  [{status}] Client {entry['client_id']:04d} | "
               f"{entry['num_samples']} samples | {entry['timestamp']}")
+        ws = entry.get("withdrawn_sample_ids") or []
+        if ws:
+            print(f"    Partial sample withdrawal: {len(ws)} id(s) — {ws[:20]}{'...' if len(ws) > 20 else ''}")
         
         if entry.get("metrics"):
             metrics_str = ", ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
@@ -84,7 +109,7 @@ def list_withdrawals(db):
     withdrawn = db.get_withdrawn_clients()
     
     if not withdrawn:
-        print("No clients are currently withdrawn.")
+        print("No clients are currently withdrawn (full-client withdrawal).")
     else:
         for client_id in withdrawn:
             info = db.withdrawals["withdrawn_clients"][client_id]
@@ -92,6 +117,18 @@ def list_withdrawals(db):
             print(f"  Withdrawn At: {info['withdrawn_at']}")
             print(f"  Reason: {info.get('reason', 'Not specified')}")
             print(f"  Affects Rounds: {info.get('affects_rounds', [])}")
+    
+    db._ensure_sample_withdrawals_schema()
+    sw = db.withdrawals.get("sample_withdrawals", {}).get("active", {})
+    print(f"\n--- Sample-level withdrawals ({len(sw)} contribution(s)) ---")
+    if not sw:
+        print("  (none)")
+    else:
+        for ck, rec in sw.items():
+            ids = rec.get("sample_ids", [])
+            print(f"  {ck}")
+            print(f"    withdrawn sample_ids ({len(ids)}): {ids[:24]}{'...' if len(ids) > 24 else ''}")
+            print(f"    at: {rec.get('withdrawn_at', '')}")
     
     print(f"\n{'='*60}\n")
 
@@ -184,8 +221,8 @@ def recalculate_models(db, dataset_name, from_round=None, to_round=None,
 
 
 def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=True, evaluate=True,
-                   model_name="simplenet", num_classes=None, num_channels=None, img_size=None, 
-                   dataset_path=None, **kwargs):
+                   model_name="simplenet", num_classes=None, num_channels=None, img_size=None,
+                   dataset_path=None, num_clients=3, **kwargs):
     """
     Unlearn a client's contributions using the specified unlearning algorithm.
     
@@ -199,7 +236,10 @@ def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=
         **kwargs: Additional algorithm-specific parameters
     """
     algorithm_name = algorithm.lower()
-    
+
+    # Handle dataset name (strip _CLASS_VERTICAL suffix if present)
+    base_dataset = dataset_name.split("_")[0] if "_" in dataset_name else dataset_name
+
     print(f"\n{'='*60}")
     if algorithm_name == "gradient":
         print(f"UNLEARNING CLIENT {client_id} (Gradient-Based Algorithm)")
@@ -209,8 +249,82 @@ def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=
         damping = kwargs.get("damping_factor", 0.01)
         influence_scale = kwargs.get("influence_scale", 1.0)
         unlearner = InfluenceFunctionBasedUnlearning(db, damping_factor=damping)
+    elif algorithm_name == "hessian":
+        print(f"UNLEARNING CLIENT {client_id} (Hessian IHVP Algorithm)")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("Error: --num-classes, --num-channels, and --img-size are required for CUSTOM datasets")
+                return None
+            net = create_model(model_name, base_dataset,
+                               num_classes=num_classes, num_channels=num_channels, img_size=img_size).to(device)
+        else:
+            net = create_model(model_name, base_dataset).to(device)
+        influence_scale = kwargs.get("influence_scale", 1.0)
+        unlearner = HessianInfluenceUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            damping=kwargs.get("damping_factor", 0.1),
+            cg_max_iter=kwargs.get("cg_max_iter", 50),
+            cg_tol=kwargs.get("cg_tol", 1e-4),
+        )
+    elif algorithm_name == "class_pruning":
+        print(f"UNLEARNING CLIENT {client_id} (Class-Discriminative Pruning, Wang et al. 2022)")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("Error: --num-classes, --num-channels, and --img-size are required for CUSTOM datasets")
+                return None
+            net = create_model(model_name, base_dataset,
+                               num_classes=num_classes, num_channels=num_channels, img_size=img_size).to(device)
+        else:
+            net = create_model(model_name, base_dataset).to(device)
+        influence_scale = kwargs.get("influence_scale", 1.0)
+        unlearner = ClassDiscriminativePruningUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            prune_ratio=kwargs.get("prune_ratio", 0.1),
+            n_probe_per_class=kwargs.get("n_probe_per_class", 64),
+            finetune_epochs=kwargs.get("finetune_epochs", 0),
+            finetune_lr=kwargs.get("finetune_lr", 1e-3),
+        )
+    elif algorithm_name == "gradient_ascent_kd":
+        print(f"UNLEARNING CLIENT {client_id} (Gradient Ascent + KD, SCRUB-style)")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("Error: --num-classes, --num-channels, and --img-size are required for CUSTOM datasets")
+                return None
+            net = create_model(model_name, base_dataset,
+                               num_classes=num_classes, num_channels=num_channels, img_size=img_size).to(device)
+        else:
+            net = create_model(model_name, base_dataset).to(device)
+        influence_scale = kwargs.get("influence_scale", 1.0)
+        unlearner = GradientAscentKDUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            epochs=kwargs.get("ga_epochs", 3),
+            lr=kwargs.get("finetune_lr", 1e-3),
+            alpha_retain=kwargs.get("alpha_retain", 1.0),
+            gamma_kd=kwargs.get("gamma_kd", 1.0),
+            beta_forget=kwargs.get("beta_forget", 1.0),
+            temperature=kwargs.get("kd_temperature", 4.0),
+            max_forget_steps=kwargs.get("max_forget_steps", None),
+        )
     else:
-        print(f"Error: Unknown algorithm '{algorithm}'. Use 'gradient' or 'influence'")
+        print(
+            f"Error: Unknown algorithm '{algorithm}'. Use 'gradient', 'influence', "
+            f"'hessian', 'class_pruning', or 'gradient_ascent_kd'"
+        )
         return None
     
     print(f"{'='*60}")
@@ -226,7 +340,7 @@ def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=
     print(f"This will remove client {client_id}'s contributions without retraining from scratch.")
     print()
     
-    if algorithm_name == "influence":
+    if algorithm_name in ("influence", "hessian", "class_pruning", "gradient_ascent_kd"):
         results = unlearner.unlearn_client_all_rounds(
             client_id=client_id,
             dataset_name=dataset_name,
@@ -256,10 +370,7 @@ def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=
     if evaluate:
         print("Evaluating unlearned models...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Handle dataset name (strip _CLASS_VERTICAL suffix if present)
-        base_dataset = dataset_name.split("_")[0] if "_" in dataset_name else dataset_name
-        
+
         if base_dataset == "CUSTOM":
             if num_classes is None or num_channels is None or img_size is None:
                 print("  Warning: Skipping evaluation - missing dataset parameters for CUSTOM dataset")
@@ -309,6 +420,404 @@ def unlearn_client(db, dataset_name, client_id, algorithm="gradient", propagate=
     return results
 
 
+def unlearn_samples(
+    db,
+    dataset_name,
+    round_num,
+    client_id,
+    sample_ids=None,
+    contribution_key=None,
+    influence_scale=1.0,
+    damping_factor=0.01,
+    evaluate=True,
+    model_name="simplenet",
+    num_classes=None,
+    num_channels=None,
+    img_size=None,
+    dataset_path=None,
+    algorithm="influence",
+    num_clients=3,
+    cg_max_iter=50,
+    cg_tol=1e-4,
+    prune_ratio=0.1,
+    n_probe_per_class=64,
+    finetune_epochs=0,
+    finetune_lr=1e-3,
+    ga_epochs=3,
+    alpha_retain=1.0,
+    gamma_kd=1.0,
+    beta_forget=1.0,
+    kd_temperature=4.0,
+    max_forget_steps=None,
+):
+    """
+    Unlearn specific samples from one client's contribution using per-sample
+    influence estimation (Eq. 3.2–3.3 adapted to sample granularity).
+
+    If ``sample_ids`` is None, the withdrawn sample IDs are read from the
+    database (i.e. whatever was marked via ``withdraw-samples``).
+    """
+    algorithm_name = algorithm.lower()
+    base_dataset = dataset_name.split("_")[0] if "_" in dataset_name else dataset_name
+
+    print(f"\n{'='*60}")
+    print(f"SAMPLE-LEVEL UNLEARNING  (round {round_num}, client {client_id}, algorithm={algorithm_name})")
+    print(f"{'='*60}")
+
+    def _build_torch_model_or_none():
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("Error: --num-classes, --num-channels, and --img-size are required for CUSTOM datasets")
+                return None, None
+            return create_model(model_name, base_dataset,
+                                num_classes=num_classes, num_channels=num_channels, img_size=img_size).to(device), device
+        return create_model(model_name, base_dataset).to(device), device
+
+    def _resolve_sample_ids():
+        if sample_ids:
+            return sample_ids
+        ck = db.resolve_contribution_key(round_num, client_id, contribution_key)
+        state = db.get_sample_withdrawal_state(ck)
+        if not state:
+            print(f"Error: No active sample withdrawals for contribution {ck}")
+            return None
+        return [int(s) for s in state["sample_ids"]]
+
+    if algorithm_name == "hessian":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = HessianInfluenceUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            damping=damping_factor,
+            cg_max_iter=cg_max_iter,
+            cg_tol=cg_tol,
+        )
+        resolved_ids = _resolve_sample_ids()
+        if resolved_ids is None:
+            return None
+        unlearned_params, metadata = unlearner.unlearn_samples_from_contribution(
+            round_num=round_num,
+            client_id=client_id,
+            sample_ids=resolved_ids,
+            influence_scale=influence_scale,
+        )
+        print(f"  Samples unlearned : {len(metadata['sample_ids'])}")
+        print(f"  FL scale          : {metadata['fl_scale']:.6f}")
+        print(f"  Client weight     : {metadata['client_weight']} / {metadata['total_weight']}")
+        save_metrics = {
+            "unlearned_samples": True,
+            "unlearned_client": client_id,
+            "unlearned_sample_ids": metadata["sample_ids"],
+            "method": metadata["method"],
+        }
+    elif algorithm_name == "class_pruning":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = ClassDiscriminativePruningUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            prune_ratio=prune_ratio,
+            n_probe_per_class=n_probe_per_class,
+            finetune_epochs=finetune_epochs,
+            finetune_lr=finetune_lr,
+        )
+        resolved_ids = _resolve_sample_ids()
+        if resolved_ids is None:
+            return None
+        unlearned_params, metadata = unlearner.unlearn_samples_from_contribution(
+            round_num=round_num,
+            client_id=client_id,
+            sample_ids=resolved_ids,
+            influence_scale=influence_scale,
+        )
+        print(f"  Samples unlearned : {len(metadata['sample_ids'])}")
+        print(f"  Target classes    : {metadata['target_classes']}")
+        print(f"  Prune ratio       : {metadata['prune_ratio']}")
+        print(f"  Channels pruned   : {metadata['pruned_channels_per_layer']}")
+        save_metrics = {
+            "unlearned_samples": True,
+            "unlearned_client": client_id,
+            "unlearned_sample_ids": metadata["sample_ids"],
+            "method": metadata["method"],
+            "prune_ratio": metadata["prune_ratio"],
+            "target_classes": metadata["target_classes"],
+        }
+    elif algorithm_name == "gradient_ascent_kd":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = GradientAscentKDUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            epochs=ga_epochs,
+            lr=finetune_lr,
+            alpha_retain=alpha_retain,
+            gamma_kd=gamma_kd,
+            beta_forget=beta_forget,
+            temperature=kd_temperature,
+            max_forget_steps=max_forget_steps,
+        )
+        resolved_ids = _resolve_sample_ids()
+        if resolved_ids is None:
+            return None
+        unlearned_params, metadata = unlearner.unlearn_samples_from_contribution(
+            round_num=round_num,
+            client_id=client_id,
+            sample_ids=resolved_ids,
+            influence_scale=influence_scale,
+        )
+        print(f"  Samples unlearned : {len(metadata['sample_ids'])}")
+        print(f"  Epochs / LR       : {metadata['epochs']} / {metadata['lr']}")
+        print(f"  Steps (forget/retain): {metadata['forget_steps_taken']} / {metadata['retain_steps_taken']}")
+        save_metrics = {
+            "unlearned_samples": True,
+            "unlearned_client": client_id,
+            "unlearned_sample_ids": metadata["sample_ids"],
+            "method": metadata["method"],
+            "epochs": metadata["epochs"],
+        }
+    else:
+        # Default: influence-function-based (first-order)
+        unlearner = InfluenceFunctionBasedUnlearning(db, damping_factor=damping_factor)
+        if sample_ids:
+            unlearned_params, metadata = unlearner.unlearn_samples_from_contribution(
+                round_num=round_num,
+                client_id=client_id,
+                sample_ids=sample_ids,
+                influence_scale=influence_scale,
+            )
+        else:
+            unlearned_params, metadata = unlearner.unlearn_withdrawn_samples(
+                round_num=round_num,
+                client_id=client_id,
+                influence_scale=influence_scale,
+                contribution_key=contribution_key,
+            )
+        print(f"  Samples unlearned : {len(metadata['sample_ids'])}")
+        print(f"  Weight fraction   : {metadata['sample_weight_fraction']:.6f}")
+        print(f"  Weight source     : {metadata['weight_source']}")
+        print(f"  Client weight     : {metadata['client_weight']} / {metadata['total_weight']}")
+        save_metrics = {
+            "unlearned_samples": True,
+            "unlearned_client": client_id,
+            "unlearned_sample_ids": metadata["sample_ids"],
+            "method": metadata["method"],
+            "weight_source": metadata["weight_source"],
+        }
+
+    db.save_aggregated_model(
+        round_num=round_num,
+        parameters=unlearned_params,
+        metrics=save_metrics,
+    )
+
+    if evaluate:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        base_dataset = dataset_name.split("_")[0] if "_" in dataset_name else dataset_name
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("  Warning: skipping evaluation — missing dataset parameters")
+                evaluate = False
+        if evaluate:
+            from model import create_model, set_parameters
+            from utils import load_data, test
+            net = create_model(
+                model_name, base_dataset,
+                **(dict(num_classes=num_classes, num_channels=num_channels, img_size=img_size)
+                   if base_dataset == "CUSTOM" else {})
+            ).to(device)
+            _, testloader = load_data(
+                base_dataset,
+                num_clients=1,
+                batch_size=32,
+                dataset_path=dataset_path,
+                img_size=img_size,
+                num_channels=num_channels,
+            )
+            set_parameters(net, unlearned_params)
+            from utils import test
+            loss, accuracy = test(net, testloader, device)
+            print(f"  Evaluation        : Loss={loss:.4f}, Accuracy={accuracy:.4f}")
+
+    print(f"{'='*60}\n")
+    return metadata
+
+
+def unlearn_samples_all_rounds(
+    db,
+    dataset_name,
+    client_id,
+    sample_ids=None,
+    algorithm="influence",
+    propagate=True,
+    influence_scale=1.0,
+    damping_factor=0.01,
+    model_name="simplenet",
+    num_classes=None,
+    num_channels=None,
+    img_size=None,
+    dataset_path=None,
+    num_clients=3,
+    cg_max_iter=50,
+    cg_tol=1e-4,
+    prune_ratio=0.1,
+    n_probe_per_class=64,
+    finetune_epochs=0,
+    finetune_lr=1e-3,
+    ga_epochs=3,
+    alpha_retain=1.0,
+    gamma_kd=1.0,
+    beta_forget=1.0,
+    kd_temperature=4.0,
+    max_forget_steps=None,
+):
+    """
+    Unlearn specific samples from a client across all rounds they appear in.
+
+    If ``sample_ids`` is None, the union of all active sample withdrawals for
+    this client is read from the database.
+
+    Args:
+        db: ContributionDB instance.
+        dataset_name: Dataset name.
+        client_id: Client whose samples should be unlearned.
+        sample_ids: Global sample IDs to remove.  None → read from DB.
+        algorithm: ``"influence"`` (first-order, default) or ``"hessian"``.
+        propagate: If True, recalculate subsequent rounds after unlearning.
+        influence_scale: Scaling factor for the influence/IHVP correction.
+        damping_factor: Damping for influence unlearning (clamping strength).
+        model_name / num_classes / num_channels / img_size / dataset_path:
+            Model/dataset arguments forwarded to HessianInfluenceUnlearning.
+        num_clients: Number of FL clients (needed to reconstruct partitions for Hessian).
+        cg_max_iter / cg_tol: Conjugate-gradient settings for Hessian method.
+
+    Returns:
+        Result dict from ``unlearn_samples_all_rounds()`` on the chosen unlearner.
+    """
+    algorithm_name = algorithm.lower()
+    base_dataset = dataset_name.split("_")[0] if "_" in dataset_name else dataset_name
+
+    # Resolve sample_ids from active withdrawals if not provided
+    if not sample_ids:
+        all_contributions = db.list_contributions(exclude_withdrawn=False)
+        client_contributions = [c for c in all_contributions if c["client_id"] == client_id]
+        merged_ids = set()
+        for contrib in client_contributions:
+            ck = contrib.get("contribution_key")
+            if ck:
+                state = db.get_sample_withdrawal_state(ck)
+                if state:
+                    merged_ids.update(int(s) for s in state.get("sample_ids", []))
+        if not merged_ids:
+            print(f"[manage_withdrawals] No active sample withdrawals for client {client_id}")
+            return {"error": f"No active sample withdrawals for client {client_id}"}
+        sample_ids = sorted(merged_ids)
+
+    print(f"\n{'='*60}")
+    print(f"MULTI-ROUND SAMPLE UNLEARNING  (client {client_id}, algorithm={algorithm_name})")
+    print(f"  Sample IDs : {sample_ids}")
+    print(f"  Propagate  : {propagate}")
+    print(f"{'='*60}")
+
+    def _build_torch_model_or_none():
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if base_dataset == "CUSTOM":
+            if num_classes is None or num_channels is None or img_size is None:
+                print("Error: --num-classes, --num-channels, and --img-size are required for CUSTOM datasets")
+                return None, None
+            return create_model(model_name, base_dataset,
+                                num_classes=num_classes, num_channels=num_channels, img_size=img_size).to(device), device
+        return create_model(model_name, base_dataset).to(device), device
+
+    if algorithm_name == "hessian":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = HessianInfluenceUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            damping=damping_factor,
+            cg_max_iter=cg_max_iter,
+            cg_tol=cg_tol,
+        )
+    elif algorithm_name == "class_pruning":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = ClassDiscriminativePruningUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            prune_ratio=prune_ratio,
+            n_probe_per_class=n_probe_per_class,
+            finetune_epochs=finetune_epochs,
+            finetune_lr=finetune_lr,
+        )
+    elif algorithm_name == "gradient_ascent_kd":
+        net, device = _build_torch_model_or_none()
+        if net is None:
+            return None
+        unlearner = GradientAscentKDUnlearning(
+            db,
+            net,
+            dataset_name,
+            num_clients=num_clients,
+            device=device,
+            epochs=ga_epochs,
+            lr=finetune_lr,
+            alpha_retain=alpha_retain,
+            gamma_kd=gamma_kd,
+            beta_forget=beta_forget,
+            temperature=kd_temperature,
+            max_forget_steps=max_forget_steps,
+        )
+    elif algorithm_name == "gradient":
+        print(
+            "Error: 'gradient' algorithm only supports client-level unlearning "
+            "(no sample-level support). Use 'influence', 'hessian', 'class_pruning', "
+            "or 'gradient_ascent_kd' for sample-level unlearning."
+        )
+        return None
+    else:
+        unlearner = InfluenceFunctionBasedUnlearning(db, damping_factor=damping_factor)
+
+    results = unlearner.unlearn_samples_all_rounds(
+        client_id=client_id,
+        sample_ids=sample_ids,
+        dataset_name=dataset_name,
+        propagate=propagate,
+        influence_scale=influence_scale,
+    )
+
+    successful = [r for r in results.get("unlearned_rounds", []) if r["status"] == "success"]
+    failed = [r for r in results.get("unlearned_rounds", []) if r["status"] != "success"]
+    print(f"\n  Rounds unlearned : {[r['round'] for r in successful]}")
+    if failed:
+        print(f"  Rounds failed    : {[(r['round'], r.get('error')) for r in failed]}")
+    print(f"  Propagated       : {results.get('propagated')}")
+    print(f"{'='*60}\n")
+
+    return results
+
+
 def compare_unlearning_algorithms(db, dataset_name, client_id, propagate=False, evaluate=True,
                                   model_name="simplenet", num_classes=None, num_channels=None,
                                   img_size=None, dataset_path=None):
@@ -340,18 +849,21 @@ def compare_unlearning_algorithms(db, dataset_name, client_id, propagate=False, 
     gradient_unlearner = GradientBasedUnlearning(db)
     influence_unlearner = InfluenceFunctionBasedUnlearning(db, damping_factor=0.01)
     
-    # Load original models for comparison
+    # Load original models for comparison.
+    #
+    # Convention (see CODEBASE_MAP.md §3 / pitfall #4): the unlearning module
+    # never adds an "unlearned" filename suffix, so filtering by the substring
+    # is a no-op. The original FL aggregate is the OLDEST aggregate file in
+    # each round dir (by mtime); newer aggregates were written by subsequent
+    # unlearning runs. Use mtime ordering instead of string filtering.
     original_models = {}
     for round_num in affected_rounds:
         round_dir = db.contributions_dir / f"round_{round_num:04d}"
         aggregated_files = list(round_dir.glob("round_*_aggregated_*_params.pkl"))
         if aggregated_files:
-            # Get the original (before unlearning)
-            original_files = [f for f in aggregated_files if "unlearned" not in str(f)]
-            if original_files:
-                latest_original = max(original_files, key=lambda p: p.stat().st_mtime)
-                with open(latest_original, 'rb') as f:
-                    original_models[round_num] = pickle.load(f)
+            oldest_original = min(aggregated_files, key=lambda p: p.stat().st_mtime)
+            with open(oldest_original, 'rb') as f:
+                original_models[round_num] = pickle.load(f)
     
     # Run gradient-based unlearning
     print("=" * 60)
@@ -501,7 +1013,18 @@ def main():
     parser = argparse.ArgumentParser(description="Manage client withdrawals and recalculate models")
     parser.add_argument(
         "command",
-        choices=["withdraw", "restore", "history", "list", "recalculate", "unlearn", "compare"],
+        choices=[
+            "withdraw",
+            "restore",
+            "withdraw-samples",
+            "restore-samples",
+            "history",
+            "list",
+            "recalculate",
+            "unlearn",
+            "unlearn-samples",
+            "compare",
+        ],
         help="Command to execute"
     )
     parser.add_argument(
@@ -571,6 +1094,23 @@ def main():
         help="Reason for withdrawal",
     )
     parser.add_argument(
+        "--sample-ids",
+        type=str,
+        default=None,
+        help="Comma-separated global sample ids (for withdraw-samples / restore-samples)",
+    )
+    parser.add_argument(
+        "--contribution-key",
+        type=str,
+        default=None,
+        help="Exact contribution_key if not using latest for round+client",
+    )
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="Restore all sample withdrawals for that contribution (restore-samples)",
+    )
+    parser.add_argument(
         "--no-propagate",
         action="store_true",
         help="Don't propagate unlearning to subsequent rounds (for unlearn command)",
@@ -584,22 +1124,103 @@ def main():
         "--algorithm",
         type=str,
         default="gradient",
-        choices=["gradient", "influence"],
-        help="Unlearning algorithm to use (for unlearn command)",
+        choices=["gradient", "influence", "hessian", "class_pruning", "gradient_ascent_kd"],
+        help=(
+            "Unlearning algorithm to use (for unlearn/unlearn-samples command). "
+            "'gradient' is client-level only; the others support sample-level."
+        ),
     )
     parser.add_argument(
         "--damping-factor",
         type=float,
         default=0.01,
-        help="Damping factor for influence-based algorithm (default 0.01)",
+        help="Damping factor for influence-based algorithm or Hessian regularisation (default 0.01; hessian default 0.1)",
     )
     parser.add_argument(
         "--influence-scale",
         type=float,
         default=1.0,
-        help="Influence scale factor for influence-based algorithm (default 1.0)",
+        help="Scale factor applied to the computed correction (default 1.0)",
     )
-    
+    parser.add_argument(
+        "--num-clients",
+        type=int,
+        default=3,
+        help="Number of clients used during training; needed by --algorithm hessian to reconstruct the data partition",
+    )
+    parser.add_argument(
+        "--cg-max-iter",
+        type=int,
+        default=50,
+        help="Max conjugate gradient iterations for --algorithm hessian (default 50)",
+    )
+    parser.add_argument(
+        "--cg-tol",
+        type=float,
+        default=1e-4,
+        help="CG convergence tolerance for --algorithm hessian (default 1e-4)",
+    )
+    parser.add_argument(
+        "--prune-ratio",
+        type=float,
+        default=0.1,
+        help="(class_pruning) fraction of channels to prune per conv layer per target class (default 0.1)",
+    )
+    parser.add_argument(
+        "--n-probe-per-class",
+        type=int,
+        default=64,
+        help="(class_pruning) probe samples per class for TF-IDF computation (default 64)",
+    )
+    parser.add_argument(
+        "--finetune-epochs",
+        type=int,
+        default=0,
+        help="(class_pruning) post-prune fine-tune epochs on retain data (default 0 = no fine-tune)",
+    )
+    parser.add_argument(
+        "--finetune-lr",
+        type=float,
+        default=1e-3,
+        help="(class_pruning / gradient_ascent_kd) fine-tune learning rate (default 1e-3)",
+    )
+    parser.add_argument(
+        "--ga-epochs",
+        type=int,
+        default=3,
+        help="(gradient_ascent_kd) outer epochs for gradient ascent + KD fine-tuning (default 3)",
+    )
+    parser.add_argument(
+        "--alpha-retain",
+        type=float,
+        default=1.0,
+        help="(gradient_ascent_kd) weight on retain CE loss (default 1.0)",
+    )
+    parser.add_argument(
+        "--gamma-kd",
+        type=float,
+        default=1.0,
+        help="(gradient_ascent_kd) weight on KD loss (default 1.0)",
+    )
+    parser.add_argument(
+        "--beta-forget",
+        type=float,
+        default=1.0,
+        help="(gradient_ascent_kd) weight on forget ascent loss (default 1.0)",
+    )
+    parser.add_argument(
+        "--kd-temperature",
+        type=float,
+        default=4.0,
+        help="(gradient_ascent_kd) KD softmax temperature (default 4.0)",
+    )
+    parser.add_argument(
+        "--max-forget-steps",
+        type=int,
+        default=None,
+        help="(gradient_ascent_kd) cap forget batches per epoch (default unlimited)",
+    )
+
     args = parser.parse_args()
     
     # Initialize database
@@ -616,6 +1237,48 @@ def main():
             print("Error: --client-id is required for restore command")
             return
         restore_client(db, args.client_id)
+    
+    elif args.command == "withdraw-samples":
+        if args.client_id is None or args.round is None:
+            print("Error: withdraw-samples requires --client-id and --round")
+            return
+        ids = parse_sample_ids(args.sample_ids)
+        if not ids:
+            print("Error: withdraw-samples requires --sample-ids (comma-separated)")
+            return
+        withdraw_samples(
+            db,
+            args.round,
+            args.client_id,
+            ids,
+            reason=args.reason,
+            contribution_key=args.contribution_key,
+        )
+    
+    elif args.command == "restore-samples":
+        if args.client_id is None or args.round is None:
+            print("Error: restore-samples requires --client-id and --round")
+            return
+        if args.all_samples:
+            restore_samples(
+                db,
+                args.round,
+                args.client_id,
+                all_samples=True,
+                contribution_key=args.contribution_key,
+            )
+        else:
+            ids = parse_sample_ids(args.sample_ids)
+            if not ids:
+                print("Error: pass --sample-ids or --all-samples")
+                return
+            restore_samples(
+                db,
+                args.round,
+                args.client_id,
+                sample_ids=ids,
+                contribution_key=args.contribution_key,
+            )
     
     elif args.command == "history":
         show_history(db, client_id=args.client_id, round_num=args.round)
@@ -641,8 +1304,8 @@ def main():
             print("Error: --client-id is required for unlearn command")
             return
         unlearn_client(
-            db, 
-            args.dataset, 
+            db,
+            args.dataset,
             args.client_id,
             algorithm=args.algorithm,
             propagate=not args.no_propagate,
@@ -652,10 +1315,59 @@ def main():
             num_channels=args.num_channels,
             img_size=args.img_size,
             dataset_path=args.dataset_path,
+            num_clients=args.num_clients,
             damping_factor=args.damping_factor,
-            influence_scale=args.influence_scale
+            influence_scale=args.influence_scale,
+            cg_max_iter=args.cg_max_iter,
+            cg_tol=args.cg_tol,
+            prune_ratio=args.prune_ratio,
+            n_probe_per_class=args.n_probe_per_class,
+            finetune_epochs=args.finetune_epochs,
+            finetune_lr=args.finetune_lr,
+            ga_epochs=args.ga_epochs,
+            alpha_retain=args.alpha_retain,
+            gamma_kd=args.gamma_kd,
+            beta_forget=args.beta_forget,
+            kd_temperature=args.kd_temperature,
+            max_forget_steps=args.max_forget_steps,
         )
-    
+
+    elif args.command == "unlearn-samples":
+        if args.client_id is None or args.round is None:
+            print("Error: unlearn-samples requires --client-id and --round")
+            return
+        ids = parse_sample_ids(args.sample_ids) if args.sample_ids else None
+        unlearn_samples(
+            db,
+            args.dataset,
+            args.round,
+            args.client_id,
+            sample_ids=ids,
+            contribution_key=args.contribution_key,
+            influence_scale=args.influence_scale,
+            damping_factor=args.damping_factor,
+            evaluate=not args.no_evaluate,
+            model_name=args.model,
+            num_classes=args.num_classes,
+            num_channels=args.num_channels,
+            img_size=args.img_size,
+            dataset_path=args.dataset_path,
+            algorithm=args.algorithm,
+            num_clients=args.num_clients,
+            cg_max_iter=args.cg_max_iter,
+            cg_tol=args.cg_tol,
+            prune_ratio=args.prune_ratio,
+            n_probe_per_class=args.n_probe_per_class,
+            finetune_epochs=args.finetune_epochs,
+            finetune_lr=args.finetune_lr,
+            ga_epochs=args.ga_epochs,
+            alpha_retain=args.alpha_retain,
+            gamma_kd=args.gamma_kd,
+            beta_forget=args.beta_forget,
+            kd_temperature=args.kd_temperature,
+            max_forget_steps=args.max_forget_steps,
+        )
+
     elif args.command == "compare":
         if args.client_id is None:
             print("Error: --client-id is required for compare command")

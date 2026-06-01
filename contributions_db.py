@@ -5,7 +5,92 @@ import pickle
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-import pickle
+
+# Large / per-sample fields stored in a sibling *_sample_manifest.json (v1).
+SAMPLE_MANIFEST_VERSION = 1
+_SAMPLE_METRIC_KEYS = frozenset(
+    {
+        "sample_ids",
+        "training_trace",
+        "training_trace_version",
+        "sample_id_scheme_version",
+    }
+)
+
+
+def _split_metrics_for_manifest(metrics: dict):
+    """Return (lean_metrics, manifest_dict_or_None).
+
+    The client serializes ``training_trace`` to a JSON string before sending
+    (Flower 1.22 rejects nested dicts in metrics). Parse it back here so
+    downstream consumers see the legacy nested-dict shape.
+    """
+    if not metrics:
+        return {}, None
+    manifest = {k: metrics[k] for k in _SAMPLE_METRIC_KEYS if k in metrics}
+    lean = {k: v for k, v in metrics.items() if k not in _SAMPLE_METRIC_KEYS}
+    if not manifest:
+        return lean, None
+    manifest = dict(manifest)
+    for json_str_key in ("training_trace", "sample_ids"):
+        if isinstance(manifest.get(json_str_key), str):
+            try:
+                manifest[json_str_key] = json.loads(manifest[json_str_key])
+            except (TypeError, json.JSONDecodeError):
+                pass  # leave as-is; downstream loaders can detect malformed values
+    manifest["sample_manifest_version"] = SAMPLE_MANIFEST_VERSION
+    return lean, manifest
+
+
+def load_contribution_metadata_file(metadata_path) -> dict:
+    """
+    Load ``*_metadata.json`` and merge optional ``*_sample_manifest.json`` when
+    ``sample_manifest_file`` is set (same directory, filename from metadata).
+
+    Returns a single dict matching the legacy shape (full ``metrics``), so callers
+    need not know whether data was split across files.
+    """
+    metadata_path = Path(metadata_path)
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    client_dir = metadata_path.parent
+    manifest_name = data.get("sample_manifest_file")
+    if manifest_name:
+        manifest_path = client_dir / manifest_name
+        if manifest_path.exists():
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            merged = dict(data.get("metrics") or {})
+            merged.update(manifest)
+            data["metrics"] = merged
+    return data
+
+
+def contribution_key_from_metadata_path(metadata_path) -> str:
+    """Return the contribution key (base filename stem) from ``*_metadata.json`` path."""
+    name = Path(metadata_path).name
+    if name.endswith("_metadata.json"):
+        return name[: -len("_metadata.json")]
+    return Path(metadata_path).stem
+
+
+def parse_round_client_from_contribution_key(contribution_key: str):
+    """
+    Parse ``round`` and ``client_id`` from a contribution key
+    ``round_RRRR_client_CCCC_<timestamp>``.
+    Returns (round_num, client_id) or (None, None) if not parseable.
+    """
+    if not contribution_key.startswith("round_") or "_client_" not in contribution_key:
+        return None, None
+    try:
+        r_end = contribution_key.index("_client_")
+        round_num = int(contribution_key[6:r_end])
+        tail = contribution_key[r_end + len("_client_") :]
+        c_end = tail.index("_")
+        client_id = int(tail[:c_end])
+        return round_num, client_id
+    except (ValueError, IndexError):
+        return None, None
 
 
 class ContributionDB:
@@ -143,6 +228,13 @@ class ContributionDB:
                 "withdrawn_clients": {},  # client_id -> {"withdrawn_at": timestamp, "reason": optional}
                 "withdrawal_history": []  # List of withdrawal events
             }
+        self._ensure_sample_withdrawals_schema()
+    
+    def _ensure_sample_withdrawals_schema(self):
+        """Ensure withdrawals.json has sample-level tracking (parallel to full-client withdrawal)."""
+        sw = self.withdrawals.setdefault("sample_withdrawals", {})
+        sw.setdefault("active", {})  # contribution_key -> { sample_ids, withdrawn_at, reason }
+        sw.setdefault("history", [])  # list of events
     
     def _save_statistics(self):
         """Save statistics to file."""
@@ -198,20 +290,33 @@ class ContributionDB:
         # Check if client is withdrawn
         is_withdrawn = self.is_client_withdrawn(client_id)
         
-        # Save metadata
+        lean_metrics, sample_manifest = _split_metrics_for_manifest(metrics or {})
+        
+        # Save metadata (lean aggregate metrics; per-sample data in *_sample_manifest.json)
         metadata = {
             "round": round_num,
             "client_id": client_id,
+            "contribution_key": base_filename,
             "timestamp": timestamp,
             "num_samples": num_samples,
             "parameters_count": len(parameters),
-            "metrics": metrics or {},
+            "metrics": lean_metrics,
             "parameters_file": f"{base_filename}_params.pkl",
-            "withdrawn": is_withdrawn
+            "withdrawn": is_withdrawn,
         }
+        if sample_manifest is not None:
+            manifest_filename = f"{base_filename}_sample_manifest.json"
+            metadata["sample_manifest_file"] = manifest_filename
+            manifest_path = client_dir / manifest_filename
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(sample_manifest, f, indent=2)
+        
+        active_sw = self.withdrawals.get("sample_withdrawals", {}).get("active", {}).get(base_filename)
+        if active_sw:
+            metadata["withdrawn_sample_ids"] = sorted(int(x) for x in active_sw.get("sample_ids", []))
         
         metadata_file = client_dir / f"{base_filename}_metadata.json"
-        with open(metadata_file, 'w') as f:
+        with open(metadata_file, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
         
         # Save parameters
@@ -285,9 +390,66 @@ class ContributionDB:
         
         return metadata_file, params_file
     
+    def save_initial_global_parameters(self, parameters):
+        """
+        Save the server global model **before** round 0 (incoming weights for all clients
+        in the first federated round). Required for replay-based per-sample gradient recovery.
+        """
+        path = self.contributions_dir / "initial_global_params.pkl"
+        meta = {
+            "type": "initial_global",
+            "timestamp": datetime.now().isoformat(),
+            "parameters_count": len(parameters),
+        }
+        with open(self.contributions_dir / "initial_global_metadata.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        with open(path, "wb") as f:
+            pickle.dump(parameters, f)
+        print(f"[Contribution DB] Saved initial global parameters: {path}")
+        return path
+    
+    def load_initial_global_parameters(self):
+        """Load list of numpy arrays for the initial global model, or None if missing."""
+        path = self.contributions_dir / "initial_global_params.pkl"
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    
+    def get_latest_aggregated_parameters(self, round_num: int):
+        """
+        Load the most recently written aggregated global model for ``round_num``
+        (the global weights **after** that federated round).
+        """
+        round_dir = self.contributions_dir / f"round_{round_num:04d}"
+        if not round_dir.is_dir():
+            return None
+        agg_files = list(round_dir.glob("*_aggregated_*_params.pkl"))
+        if not agg_files:
+            return None
+        latest = max(agg_files, key=lambda p: p.stat().st_mtime)
+        with open(latest, "rb") as f:
+            return pickle.load(f)
+    
+    def load_incoming_global_for_round(self, round_num: int):
+        """
+        Global model weights **at the start** of federated round ``round_num``
+        (what clients receive before local training).
+
+        - Round 0: initial global model (``save_initial_global_parameters``).
+        - Round R>0: aggregated model after round R-1.
+        """
+        if round_num == 0:
+            return self.load_initial_global_parameters()
+        return self.get_latest_aggregated_parameters(round_num - 1)
+    
     def get_contribution_info(self, round_num, client_id):
         """
         Retrieve information about a specific contribution.
+
+        If ``sample_manifest_file`` is present, the sibling ``*_sample_manifest.json``
+        is loaded and its fields are merged into ``metrics`` (same shape as legacy
+        single-file metadata).
         
         Args:
             round_num: Round number
@@ -308,51 +470,143 @@ class ContributionDB:
             return None
         
         latest_metadata = max(metadata_files, key=lambda p: p.stat().st_mtime)
-        with open(latest_metadata, 'r') as f:
-            return json.load(f)
+        data = load_contribution_metadata_file(latest_metadata)
+        self.enrich_contribution_view(data, latest_metadata)
+        return data
     
-    def list_contributions(self, round_num=None):
+    def enrich_contribution_view(self, contrib: dict, metadata_path=None):
         """
-        List all contributions, optionally filtered by round.
-        
-        Args:
-            round_num: Optional round number to filter by
-            
-        Returns:
-            List of contribution metadata dictionaries
+        Attach ``contribution_key`` (if missing) and ``withdrawn_sample_ids`` from
+        ``sample_withdrawals.active`` in withdrawals.json (source of truth).
         """
-        contributions = []
-        
-        if round_num is not None:
-            rounds_to_check = [round_num]
+        if metadata_path is not None:
+            if not contrib.get("contribution_key"):
+                contrib["contribution_key"] = contribution_key_from_metadata_path(metadata_path)
+        key = contrib.get("contribution_key")
+        if not key:
+            return
+        self._ensure_sample_withdrawals_schema()
+        entry = self.withdrawals["sample_withdrawals"]["active"].get(key)
+        if entry:
+            contrib["withdrawn_sample_ids"] = sorted(int(x) for x in entry.get("sample_ids", []))
         else:
-            # Parse round numbers from directory names, handling errors gracefully
-            rounds_to_check = []
-            for d in self.contributions_dir.iterdir():
-                if d.is_dir() and d.name.startswith('round_'):
-                    try:
-                        # Extract round number from "round_XXXX" format
-                        round_num_val = int(d.name.split('_')[1])
-                        rounds_to_check.append(round_num_val)
-                    except (ValueError, IndexError):
-                        # Skip directories that don't match the expected format
-                        continue
-            rounds_to_check = sorted(rounds_to_check)
-        
-        for rnd in rounds_to_check:
-            round_dir = self.contributions_dir / f"round_{rnd:04d}"
-            if not round_dir.exists():
-                continue
-            
-            # Get client contributions
-            for client_dir in round_dir.iterdir():
-                if client_dir.is_dir() and client_dir.name.startswith('client_'):
-                    metadata_files = list(client_dir.glob("*_metadata.json"))
-                    for metadata_file in metadata_files:
-                        with open(metadata_file, 'r') as f:
-                            contributions.append(json.load(f))
-        
-        return contributions
+            contrib.setdefault("withdrawn_sample_ids", [])
+    
+    def resolve_contribution_key(self, round_num, client_id, contribution_key=None):
+        """Resolve contribution key; default is latest contribution for (round, client)."""
+        if contribution_key:
+            return contribution_key
+        c = self.get_contribution_info(round_num, client_id)
+        if c and c.get("contribution_key"):
+            return c["contribution_key"]
+        raise ValueError(f"No contribution found for round {round_num} client {client_id}")
+    
+    def withdraw_samples_from_contribution(self, contribution_key, sample_ids, reason=None):
+        """
+        Mark specific global sample IDs as withdrawn for one contribution (atomic unit is still
+        one saved contribution; this withdraws a **part** of it). Independent of full-client
+        ``withdrawn`` flag.
+        """
+        self._ensure_sample_withdrawals_schema()
+        sample_ids = sorted({int(x) for x in sample_ids})
+        if not sample_ids:
+            raise ValueError("sample_ids must be non-empty")
+        sw = self.withdrawals["sample_withdrawals"]
+        prev = sw["active"].get(contribution_key, {})
+        prev_ids = set(prev.get("sample_ids", []))
+        prev_ids |= set(sample_ids)
+        merged = sorted(prev_ids)
+        ts = datetime.now().isoformat()
+        sw["active"][contribution_key] = {
+            "sample_ids": merged,
+            "withdrawn_at": ts,
+            "reason": reason,
+        }
+        sw["history"].append(
+            {
+                "event": "withdraw_samples",
+                "contribution_key": contribution_key,
+                "sample_ids": list(sample_ids),
+                "withdrawn_at": ts,
+                "reason": reason,
+            }
+        )
+        self._save_withdrawals()
+        self._set_denormalized_withdrawn_sample_ids(contribution_key, merged)
+        print(
+            f"[Contribution DB] Sample withdrawal on {contribution_key}: "
+            f"{len(merged)} sample id(s) withdrawn in total"
+        )
+        return sw["active"][contribution_key]
+    
+    def restore_samples_from_contribution(self, contribution_key, sample_ids=None, all_samples=False):
+        """
+        Remove sample IDs from the active sample-withdrawal set for this contribution.
+        If ``all_samples`` is True, clear all sample withdrawals for the contribution.
+        """
+        self._ensure_sample_withdrawals_schema()
+        sw = self.withdrawals["sample_withdrawals"]
+        if contribution_key not in sw["active"]:
+            print(f"[Contribution DB] No active sample withdrawal for {contribution_key}")
+            return False
+        if all_samples:
+            del sw["active"][contribution_key]
+            remaining = []
+        else:
+            if not sample_ids:
+                raise ValueError("Pass sample_ids or use all_samples=True")
+            to_remove = {int(x) for x in sample_ids}
+            cur = set(sw["active"][contribution_key].get("sample_ids", []))
+            cur -= to_remove
+            if not cur:
+                del sw["active"][contribution_key]
+                remaining = []
+            else:
+                sw["active"][contribution_key]["sample_ids"] = sorted(cur)
+                remaining = sorted(cur)
+        ts = datetime.now().isoformat()
+        sw["history"].append(
+            {
+                "event": "restore_samples",
+                "contribution_key": contribution_key,
+                "sample_ids": None if all_samples else list(sample_ids),
+                "all_samples": all_samples,
+                "restored_at": ts,
+            }
+        )
+        self._save_withdrawals()
+        self._set_denormalized_withdrawn_sample_ids(contribution_key, remaining)
+        return True
+    
+    def get_sample_withdrawal_state(self, contribution_key: str):
+        """Return the active sample-withdrawal record for a contribution, or None."""
+        self._ensure_sample_withdrawals_schema()
+        return self.withdrawals["sample_withdrawals"]["active"].get(contribution_key)
+    
+    def is_sample_withdrawn_for_contribution(self, contribution_key: str, sample_id: int) -> bool:
+        st = self.get_sample_withdrawal_state(contribution_key)
+        if not st:
+            return False
+        return int(sample_id) in set(st.get("sample_ids", []))
+    
+    def _set_denormalized_withdrawn_sample_ids(self, contribution_key: str, sample_ids: list):
+        """Mirror withdrawn_sample_ids on *_metadata.json for grep-friendly inspection."""
+        rn, cid = parse_round_client_from_contribution_key(contribution_key)
+        if rn is None:
+            return
+        path = (
+            self.contributions_dir
+            / f"round_{rn:04d}"
+            / f"client_{cid:04d}"
+            / f"{contribution_key}_metadata.json"
+        )
+        if not path.exists():
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["withdrawn_sample_ids"] = list(sample_ids)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
     
     def get_statistics(self):
         """Get overall statistics about contributions."""
@@ -362,7 +616,47 @@ class ContributionDB:
         for round_num in stats["rounds"]:
             stats["rounds"][round_num]["clients"] = list(stats["rounds"][round_num]["clients"])
         return stats
-    
+
+    def find_rounds_containing_samples(self, client_id: int, sample_ids: list) -> dict:
+        """
+        Find all rounds where a client's contribution contained specific sample IDs.
+
+        Scans the sample manifest (``*_sample_manifest.json``) for each contribution
+        by ``client_id`` and returns the subset of ``sample_ids`` that appears in each
+        round.  If a contribution has no sample manifest (training trace was disabled),
+        the full ``sample_ids`` list is assumed present for that round so that unlearning
+        is conservative rather than silent.
+
+        Args:
+            client_id: The client whose contributions to scan.
+            sample_ids: Global sample IDs to search for.
+
+        Returns:
+            Dict mapping ``round_num`` -> list of sample IDs found in that round.
+            Only rounds where at least one target sample appears (or where no manifest
+            exists) are included.
+        """
+        target = set(int(s) for s in sample_ids)
+        result = {}
+
+        all_contributions = self.list_contributions(exclude_withdrawn=False)
+        client_contributions = [c for c in all_contributions if c["client_id"] == client_id]
+
+        for contrib in sorted(client_contributions, key=lambda c: c["round"]):
+            round_num = contrib["round"]
+            metrics = contrib.get("metrics") or {}
+            manifest_sample_ids = metrics.get("sample_ids")
+
+            if manifest_sample_ids is None:
+                # No sample manifest — conservative: assume all target samples present
+                result[round_num] = sorted(target)
+            else:
+                found = sorted(target & set(int(s) for s in manifest_sample_ids))
+                if found:
+                    result[round_num] = found
+
+        return result
+
     def withdraw_client(self, client_id, reason=None):
         """
         Mark a client as withdrawn (like git, contributions are preserved but marked).
@@ -502,8 +796,8 @@ class ContributionDB:
                 if client_dir.is_dir() and client_dir.name.startswith('client_'):
                     metadata_files = list(client_dir.glob("*_metadata.json"))
                     for metadata_file in metadata_files:
-                        with open(metadata_file, 'r') as f:
-                            contrib = json.load(f)
+                        contrib = load_contribution_metadata_file(metadata_file)
+                        self.enrich_contribution_view(contrib, metadata_file)
                         
                         # Check withdrawal status
                         client_id = contrib["client_id"]
@@ -520,6 +814,10 @@ class ContributionDB:
         """
         Recalculate aggregated model for a round excluding withdrawn clients.
         This implements the "git-like" behavior of rebuilding without withdrawn contributions.
+
+        When a contribution has withdrawn samples (``withdrawn_sample_ids``), its
+        fed-averaging weight is reduced to ``num_samples - len(withdrawn_sample_ids)``
+        so the clean recomputation path is consistent with per-sample withdrawals.
         
         Args:
             round_num: Round number to recalculate
@@ -553,15 +851,16 @@ class ContributionDB:
             with open(params_file, 'rb') as f:
                 params = pickle.load(f)
             
-            num_samples = contrib["num_samples"]
-            
+            withdrawn_n = len(contrib.get("withdrawn_sample_ids") or [])
+            num_samples = max(1, contrib["num_samples"] - withdrawn_n)
+
             # Initialize or accumulate weighted parameters
             if weighted_params is None:
                 weighted_params = [p * num_samples for p in params]
             else:
                 for i in range(len(weighted_params)):
                     weighted_params[i] += params[i] * num_samples
-            
+
             total_samples += num_samples
         
         if total_samples == 0 or weighted_params is None:
@@ -603,7 +902,9 @@ class ContributionDB:
                 "timestamp": contrib["timestamp"],
                 "num_samples": contrib["num_samples"],
                 "withdrawn": contrib.get("withdrawn", False),
-                "metrics": contrib.get("metrics", {})
+                "metrics": contrib.get("metrics", {}),
+                "contribution_key": contrib.get("contribution_key"),
+                "withdrawn_sample_ids": contrib.get("withdrawn_sample_ids", []),
             }
             history.append(history_entry)
         
